@@ -600,6 +600,8 @@ FLORENCE_DEFAULT_MODEL = "MiaoshouAI/Florence-2-base-PromptGen"
 FLORENCE_MODELS = [FLORENCE_DEFAULT_MODEL, "microsoft/Florence-2-base", "microsoft/Florence-2-large"]
 FLORENCE_TASKS = ["<CAPTION>", "<DETAILED_CAPTION>", "<MORE_DETAILED_CAPTION>"]
 QWEN_CAPTION_MODEL = "Qwen3-VL 4B (Krea 2 text encoder)"
+QWEN_CAPTION_MODEL_8B = "Qwen3-VL 8B (Krea 2 text encoder)"
+QWEN_CAPTION_MODELS = (QWEN_CAPTION_MODEL, QWEN_CAPTION_MODEL_8B)
 QWEN_CUSTOM_TASK = "Custom…"
 
 # Prefs whose VALUE is a directory we want to keep portable across repo
@@ -661,6 +663,7 @@ DEFAULT_PREFS = {
     "krea2_turbo_dit": "",
     "krea2_vae": "",
     "krea2_text_encoder": "",
+    "krea2_text_encoder_8b": "",
     # Turbo distillation LoRA (rank 64) — RAW + this at strength 1.0 behaves as the Turbo
     # model, so samples can render on the resident training DiT instead of loading the
     # separate Turbo checkpoint (saves the park-to-CPU shuffle during previews).
@@ -4426,6 +4429,7 @@ class LoRATrainerGUI:
         head.pack(fill=tk.X, padx=14, pady=(12, 6))
         tk.Label(head, text="Problem Images", font=(FONT_FAMILY, 15, "bold"),
                  fg=COLORS["text_primary"], bg=COLORS["bg_deep"]).pack(side=tk.LEFT)
+        ttk.Button(head, text="Separate", command=self._separate_stuck_images).pack(side=tk.RIGHT, padx=(0, 6))
         ttk.Button(head, text="Refresh", command=lambda: self._refresh_problem_images(force=True)).pack(side=tk.RIGHT)
         self._problem_status = tk.Label(win, text="", font=(FONT_FAMILY, 9),
                                         fg=COLORS["text_muted"], bg=COLORS["bg_deep"],
@@ -4475,6 +4479,86 @@ class LoRATrainerGUI:
                 pass  # one bad refresh (e.g. odd JSON shape) must not kill the auto-refresh loop
             win.after(4000, _tick)
         win.after(4000, _tick)
+
+    def _separate_stuck_images(self):
+        """Copy every image currently verdict='stuck' (plus its caption) into <dataset>/stuck/.
+        COPY, not move — the live run is undisturbed and the originals stay in the dataset."""
+        win = getattr(self, "_problem_win", None)
+        if win is None or not win.winfo_exists():
+            return
+        path = self._problem_images_json_path()
+        if not path or not os.path.exists(path):
+            messagebox.showinfo("Problem Images",
+                                "No problem_images.json yet — nothing to separate.", parent=win)
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            messagebox.showerror("Problem Images",
+                                 f"Could not read problem_images.json:\n{e}", parent=win)
+            return
+        images = data.get("images") if isinstance(data, dict) else None
+        if not isinstance(images, dict) or not images:
+            messagebox.showinfo("Problem Images",
+                                "No images tracked yet — nothing to separate.", parent=win)
+            return
+        stuck_keys = [k for k, s in images.items()
+                      if isinstance(s, dict) and s.get("verdict") == "stuck"]
+        if not stuck_keys:
+            messagebox.showinfo("Problem Images",
+                                "No images are currently marked 'stuck'.", parent=win)
+            return
+        folder = self.image_folder_var.get().strip() if hasattr(self, "image_folder_var") else ""
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Problem Images",
+                                 "Dataset image folder is not set — can't locate the stuck files.",
+                                 parent=win)
+            return
+        dest_dir = os.path.join(folder, "stuck")
+        if not messagebox.askyesno(
+                "Separate stuck images",
+                f"Copy {len(stuck_keys)} stuck image(s) + their captions to:\n\n{dest_dir}\n\n"
+                f"This COPIES — originals stay in the dataset (the live run is undisturbed).",
+                parent=win):
+            return
+        import shutil
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("Problem Images",
+                                 f"Could not create {dest_dir}:\n{e}", parent=win)
+            return
+        copied = 0
+        skipped = []
+        for key in stuck_keys:
+            img_path = self._find_dataset_image(key)
+            if not img_path:
+                skipped.append(f"{os.path.basename(key)} (image not found on disk)")
+                continue
+            try:
+                base = os.path.basename(img_path)
+                target = os.path.join(dest_dir, base)
+                n = 2
+                while os.path.exists(target):
+                    stem, ext = os.path.splitext(base)
+                    target = os.path.join(dest_dir, f"{stem}_{n}{ext}")
+                    n += 1
+                shutil.copy2(img_path, target)
+                cap_path = self._find_dataset_caption(key)
+                if cap_path and os.path.exists(cap_path):
+                    cap_ext = os.path.splitext(cap_path)[1]
+                    cap_target = os.path.splitext(target)[0] + cap_ext
+                    shutil.copy2(cap_path, cap_target)
+                copied += 1
+            except Exception as e:
+                skipped.append(f"{os.path.basename(key)} ({e})")
+        msg = f"Copied {copied} stuck image(s) to:\n{dest_dir}"
+        if skipped:
+            msg += f"\n\nSkipped {len(skipped)}:\n" + "\n".join(skipped[:10])
+            if len(skipped) > 10:
+                msg += f"\n…and {len(skipped) - 10} more."
+        messagebox.showinfo("Separate stuck images", msg, parent=win)
 
     def _refresh_problem_images(self, force: bool = False):
         """Re-read problem_images.json (only rebuilds when the file changed, unless forced)."""
@@ -5535,11 +5619,13 @@ class LoRATrainerGUI:
         self.caption_model_combo.grid(row=3, column=1, sticky=tk.W, pady=4)
         self.caption_model_combo.bind("<<ComboboxSelected>>",
                                       lambda e: self._on_caption_model_changed())
-        # The Qwen3-VL entry appears as soon as the Krea 2 text encoder path is filled in on
-        # Preferences — no restart. It's a captioner for ANY dataset, Klein included; the file
-        # just happens to ship with the Krea 2 models.
+        # The Qwen3-VL entries appear as soon as the matching Krea 2 text encoder path is
+        # filled in on Preferences — no restart. They caption ANY dataset, Klein included;
+        # the files just happen to ship with the Krea 2 models.
         try:
             self.prefs_vars["krea2_text_encoder"].trace_add(
+                "write", lambda *_: self._refresh_caption_model_values())
+            self.prefs_vars["krea2_text_encoder_8b"].trace_add(
                 "write", lambda *_: self._refresh_caption_model_values())
         except Exception:
             pass
@@ -5619,6 +5705,7 @@ class LoRATrainerGUI:
             "Bulk-edit every `.txt` caption file in the image folder. Preview first to see which files change.",
         )
         fr_card.grid_columnconfigure(1, weight=1)
+        fr_card.grid_columnconfigure(3, weight=1)
 
         ttk.Label(fr_card, text="Find:").grid(row=0, column=0, sticky=tk.W, padx=(0, 10), pady=4)
         self.find_text_var = tk.StringVar()
@@ -5628,8 +5715,18 @@ class LoRATrainerGUI:
         self.replace_text_var = tk.StringVar()
         ttk.Entry(fr_card, textvariable=self.replace_text_var, width=40).grid(row=1, column=1, sticky=tk.EW, pady=4)
 
+        # Right column: Prefix/Suffix — prepends/appends the Text to every caption,
+        # skipping ones that already start/end with it. Pads with a single space.
+        ttk.Label(fr_card, text="Text:").grid(row=0, column=2, sticky=tk.W, padx=(20, 10), pady=4)
+        self.prefix_suffix_text_var = tk.StringVar()
+        ttk.Entry(fr_card, textvariable=self.prefix_suffix_text_var, width=40).grid(row=0, column=3, sticky=tk.EW, pady=4)
+        ps_btns = tk.Frame(fr_card, bg=COLORS["bg_surface"])
+        ps_btns.grid(row=1, column=2, columnspan=2, sticky=tk.W, pady=4)
+        ttk.Button(ps_btns, text="Prefix", command=self.add_prefix_to_captions).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(ps_btns, text="Suffix", command=self.add_suffix_to_captions).pack(side=tk.LEFT)
+
         fr_buttons = tk.Frame(fr_card, bg=COLORS["bg_surface"])
-        fr_buttons.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+        fr_buttons.grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(8, 0))
         ttk.Button(fr_buttons, text="Replace in All .txt Files", command=self.find_replace_in_captions).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(fr_buttons, text="Preview Changes", command=self.preview_find_replace).pack(side=tk.LEFT)
 
@@ -5900,18 +5997,34 @@ class LoRATrainerGUI:
         p = self._krea2_pref("krea2_text_encoder") if hasattr(self, "prefs_vars") else ""
         return p if (p and os.path.isfile(p)) else ""
 
+    def _qwen_captioner_path_8b(self) -> str:
+        """The 8B Qwen3-VL variant, if set and on disk — else ""."""
+        p = self._krea2_pref("krea2_text_encoder_8b") if hasattr(self, "prefs_vars") else ""
+        return p if (p and os.path.isfile(p)) else ""
+
     def _caption_model_values(self):
-        """Model dropdown contents. Qwen3-VL is offered whenever its file exists — it captions to
-        .txt like Florence does, so it serves Klein datasets just as well as Krea 2 ones."""
-        return FLORENCE_MODELS + ([QWEN_CAPTION_MODEL] if self._qwen_captioner_path() else [])
+        """Model dropdown contents. Each Qwen3-VL variant is offered whenever its file exists —
+        they caption to .txt like Florence does, so they serve Klein datasets just as well as
+        Krea 2 ones."""
+        vals = list(FLORENCE_MODELS)
+        if self._qwen_captioner_path():
+            vals.append(QWEN_CAPTION_MODEL)
+        if self._qwen_captioner_path_8b():
+            vals.append(QWEN_CAPTION_MODEL_8B)
+        return vals
 
     def _default_caption_model(self) -> str:
         """What to select when there is no usable saved choice.
 
         Qwen3-VL wherever its file exists: it follows an editable instruction written to the
         captioning doctrine, so it produces better training data than Florence out of the box.
-        Florence is the fallback for anyone without that file."""
-        return QWEN_CAPTION_MODEL if self._qwen_captioner_path() else FLORENCE_DEFAULT_MODEL
+        The 4B is preferred when both are present (smaller, the documented default); the 8B is
+        offered only to people who deliberately downloaded it. Florence is the fallback."""
+        if self._qwen_captioner_path():
+            return QWEN_CAPTION_MODEL
+        if self._qwen_captioner_path_8b():
+            return QWEN_CAPTION_MODEL_8B
+        return FLORENCE_DEFAULT_MODEL
 
     def _initial_caption_model(self) -> str:
         """Startup selection: the saved choice if it is still offered, else the default.
@@ -5961,7 +6074,17 @@ class LoRATrainerGUI:
         self._on_caption_model_changed()
 
     def _is_qwen_captioner(self) -> bool:
-        return self.caption_model_var.get() == QWEN_CAPTION_MODEL
+        return self.caption_model_var.get() in QWEN_CAPTION_MODELS
+
+    def _selected_qwen_captioner_path(self) -> str:
+        """Path of whichever Qwen3-VL variant is currently selected (4B or 8B), or "" if a
+        Florence model is selected. Caller is responsible for handling the empty case."""
+        choice = self.caption_model_var.get()
+        if choice == QWEN_CAPTION_MODEL:
+            return self._qwen_captioner_path()
+        if choice == QWEN_CAPTION_MODEL_8B:
+            return self._qwen_captioner_path_8b()
+        return ""
 
     def _qwen_task_labels(self):
         from fizgig.krea2.embedder import CAPTION_TASKS
@@ -6462,23 +6585,27 @@ class LoRATrainerGUI:
             return None
 
     def load_qwen_captioner(self):
-        """Load the Krea 2 Qwen3-VL text encoder for captioning (lazy, ~8 GB bf16)."""
+        """Load the Krea 2 Qwen3-VL text encoder for captioning (lazy, ~8 GB bf16 for the 4B,
+        larger for the 8B variant)."""
         if getattr(self, "qwen_captioner", None) is not None:
             return True
-        path = self._qwen_captioner_path()
+        path = self._selected_qwen_captioner_path()
+        is_8b = self.caption_model_var.get() == QWEN_CAPTION_MODEL_8B
         if not path:
-            self.update_caption_log("Qwen3-VL captioner: the Krea 2 text encoder path isn't set "
-                                    "(Preferences tab), or the file is missing.\n")
+            self.update_caption_log("Qwen3-VL captioner: the matching Krea 2 text encoder path "
+                                    "isn't set (Preferences tab), or the file is missing.\n")
             return False
         try:
-            self.update_caption_log(f"Loading Qwen3-VL captioner (~8 GB) from "
+            size_note = "~17 GB" if is_8b else "~8 GB"
+            self.update_caption_log(f"Loading Qwen3-VL captioner ({size_note}) from "
                                     f"{os.path.basename(path)}...\n")
             self.master.update_idletasks()
             sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
             import torch
             from fizgig.krea2.utils import load_krea2_text_encoder
             device = "cuda" if torch.cuda.is_available() else "cpu"
-            self.qwen_captioner = load_krea2_text_encoder(path, dtype=torch.bfloat16, device=device)
+            self.qwen_captioner = load_krea2_text_encoder(
+                path, dtype=torch.bfloat16, device=device, is_8b=is_8b)
             self.update_caption_log(f"Qwen3-VL captioner ready on {device}.\n")
             return True
         except Exception as e:
@@ -6533,13 +6660,15 @@ class LoRATrainerGUI:
         self.qwen_captioner = None
         gc.collect()
         torch.cuda.empty_cache()
-        self.update_caption_log("Qwen3-VL unloaded — ~8 GB of VRAM released.\n")
+        size_note = "~17 GB" if self.caption_model_var.get() == QWEN_CAPTION_MODEL_8B else "~8 GB"
+        self.update_caption_log(f"Qwen3-VL unloaded — {size_note} of VRAM released.\n")
 
     def _caption_model_blocked_by_training(self) -> bool:
         """True (with a message) if a training run is live and the chosen captioner won't co-fit.
 
-        Qwen3-VL is ~8 GB — loading it alongside a resident training DiT is an OOM either for the
-        captioner or, worse, for the run. Florence-2 is small enough to leave alone."""
+        Qwen3-VL is ~8 GB for the 4B (much more for the 8B) — loading it alongside a resident
+        training DiT is an OOM either for the captioner or, worse, for the run. Florence-2 is
+        small enough to leave alone."""
         if not self._is_qwen_captioner():
             return False
         proc = getattr(self, "current_process", None)
@@ -6548,9 +6677,11 @@ class LoRATrainerGUI:
         except Exception:
             running = False
         if running:
+            is_8b = self.caption_model_var.get() == QWEN_CAPTION_MODEL_8B
+            size_note = "~17 GB" if is_8b else "about 8 GB"
             messagebox.showwarning(
                 "Training is running",
-                "The Qwen3-VL captioner needs about 8 GB of VRAM, which won't fit alongside a "
+                f"The Qwen3-VL captioner needs {size_note} of VRAM, which won't fit alongside a "
                 "training run — and trying would risk the run itself.\n\n"
                 "Wait for training to finish, or switch the Model dropdown to Florence-2.")
         return running
@@ -6770,6 +6901,67 @@ class LoRATrainerGUI:
             self.refresh_caption_images()
 
         return results
+
+    def add_prefix_to_captions(self):
+        """Prepend the Prefix/Suffix Text to every .txt caption in the image folder.
+        Captions that already start with it (ignoring leading whitespace) are skipped."""
+        self._affix_captions(prefix=True)
+
+    def add_suffix_to_captions(self):
+        """Append the Prefix/Suffix Text to every .txt caption in the image folder.
+        Captions that already end with it (ignoring trailing whitespace) are skipped."""
+        self._affix_captions(prefix=False)
+
+    def _affix_captions(self, prefix: bool):
+        """Shared worker for add_prefix_to_captions / add_suffix_to_captions. Adds the text
+        with a single space separator to each .txt caption; skips ones that already have it
+        at the chosen end (checked on the stripped body so leading/trailing whitespace
+        doesn't defeat the dedupe). Trailing newlines are preserved."""
+        folder = self.image_folder_var.get().strip() if hasattr(self, "image_folder_var") else ""
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Error", "Please select a valid folder")
+            return
+        text = self.prefix_suffix_text_var.get().strip()
+        if not text:
+            messagebox.showerror("Error", "Please enter text to add")
+            return
+        txt_files = glob.glob(os.path.join(glob.escape(folder), "*.txt"))
+        changed = 0
+        skipped = 0
+        errors = 0
+        for txt_file in txt_files:
+            try:
+                with open(txt_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+                stripped = content.strip()
+                if not stripped:
+                    skipped += 1   # empty caption — nothing meaningful to affix
+                    continue
+                if prefix:
+                    if stripped.startswith(text):
+                        skipped += 1
+                        continue
+                    new_content = text + " " + content.lstrip()
+                else:
+                    if stripped.endswith(text):
+                        skipped += 1
+                        continue
+                    # Keep any trailing newline/whitespace OUTSIDE the new text so the
+                    # caption still ends with `text` (not text + "\n"), then re-attach it.
+                    trailing_ws = content[len(content.rstrip()):]
+                    new_content = content.rstrip() + " " + text + trailing_ws
+                with open(txt_file, "w", encoding="utf-8") as f:
+                    f.write(new_content)
+                changed += 1
+            except Exception as e:
+                errors += 1
+                self.update_caption_log(f"Error processing {os.path.basename(txt_file)}: {e}\n")
+        action = "Prepended" if prefix else "Appended"
+        self.update_caption_log(
+            f"{action} '{text}' to {changed} caption(s); skipped {skipped} (already had it or empty)"
+            + (f"; {errors} error(s)" if errors else "") + "\n")
+        if changed:
+            self.refresh_caption_images()
 
     def preview_find_replace(self):
         """Preview find/replace changes"""
@@ -12453,6 +12645,11 @@ class LoRATrainerGUI:
             download_label2="bf16",
             download_note2="~8.9GB bf16 — the full-precision original, if you would rather not "
                            "quantise at all",
+        )
+        kr = self._add_pref_row(
+            krea_card, kr, "Qwen3-VL TE 8B:", "krea2_text_encoder_8b",
+            "Qwen3-VL-8B text encoder. Optional alternative to the 4B above — larger VRAM footprint, "
+            "use only if you have a specific reason to prefer the 8B variant",
         )
         kr = self._add_pref_row(
             krea_card, kr, "Turbo LoRA (rank 64):", "krea2_turbo_lora",

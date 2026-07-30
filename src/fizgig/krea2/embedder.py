@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 # Only the tokenizer is still fetched by repo id (small, HF-cached after first use).
 QWEN3_VL_4B_INSTRUCT_REPO_ID = "Qwen/Qwen3-VL-4B-Instruct"
+QWEN3_VL_8B_INSTRUCT_REPO_ID = "Qwen/Qwen3-VL-8B-Instruct"
 
 # Vendored copy of the Qwen3-VL-4B-Instruct config.json so the text encoder is built
 # without fetching the config from the Hugging Face Hub. Qwen3-VL is natively supported by
@@ -88,6 +89,61 @@ QWEN3_VL_4B_INSTRUCT_CONFIG = {
     "vision_start_token_id": 151652,
 }
 
+# Vendored Qwen3-VL-8B-Instruct config — same shape as the 4B block above. The 8B has a wider
+# text trunk (hidden 4096 / intermediate 12288 / untied lm_head) and a deeper, wider vision
+# tower (depth 27, vision hidden 1152, out_hidden 4096). Vendoring it here lets the Captions
+# tab load an 8B checkpoint (e.g. the NSFW-Caption fine-tune) without a Hub config fetch, the
+# same way the 4B already does.
+QWEN3_VL_8B_INSTRUCT_CONFIG = {
+    "architectures": ["Qwen3VLForConditionalGeneration"],
+    "image_token_id": 151655,
+    "model_type": "qwen3_vl",
+    "text_config": {
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "bos_token_id": 151643,
+        "dtype": "bfloat16",
+        "eos_token_id": 151645,
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "hidden_size": 4096,
+        "initializer_range": 0.02,
+        "intermediate_size": 12288,
+        "max_position_embeddings": 262144,
+        "model_type": "qwen3_vl_text",
+        "num_attention_heads": 32,
+        "num_hidden_layers": 36,
+        "num_key_value_heads": 8,
+        "rms_norm_eps": 1e-06,
+        "rope_scaling": {"mrope_interleaved": True, "mrope_section": [24, 20, 20], "rope_type": "default"},
+        "rope_theta": 5000000,
+        "tie_word_embeddings": False,
+        "use_cache": True,
+        "vocab_size": 151936,
+    },
+    "tie_word_embeddings": False,
+    "transformers_version": "4.57.0.dev0",
+    "video_token_id": 151656,
+    "vision_config": {
+        "deepstack_visual_indexes": [8, 16, 24],
+        "depth": 27,
+        "hidden_act": "gelu_pytorch_tanh",
+        "hidden_size": 1152,
+        "in_channels": 3,
+        "initializer_range": 0.02,
+        "intermediate_size": 4304,
+        "model_type": "qwen3_vl",
+        "num_heads": 16,
+        "num_position_embeddings": 2304,
+        "out_hidden_size": 4096,
+        "patch_size": 16,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 2,
+    },
+    "vision_end_token_id": 151653,
+    "vision_start_token_id": 151652,
+}
+
 
 @dataclass
 class TextEncoderConfig:
@@ -123,13 +179,16 @@ def _load_qwen3_vl_model(
     dtype: torch.dtype,
     device: torch.device | str,
     disable_mmap: bool = True,
+    is_8b: bool = False,
 ) -> Qwen3VLForConditionalGeneration:
-    """Build Qwen3-VL-4B from the vendored config and load weights from a local safetensors."""
-    config = Qwen3VLConfig.from_dict(QWEN3_VL_4B_INSTRUCT_CONFIG)
+    """Build Qwen3-VL (4B by default, 8B if is_8b) from the vendored config and load weights
+    from a local safetensors."""
+    config = Qwen3VLConfig.from_dict(
+        QWEN3_VL_8B_INSTRUCT_CONFIG if is_8b else QWEN3_VL_4B_INSTRUCT_CONFIG)
     with init_empty_weights():
         model = Qwen3VLForConditionalGeneration._from_config(config)
 
-    logger.info(f"Loading Krea 2 text encoder (Qwen3-VL) weights from {model_path}")
+    logger.info(f"Loading Krea 2 text encoder (Qwen3-VL-{'8B' if is_8b else '4B'}) weights from {model_path}")
     # ComfyUI's fp8_scaled variant quantises ONLY the language Linears — its 315 vision-tower
     # tensors are bf16, so reference images and captioning work exactly as on the bf16 file.
     # (An earlier comment here claimed the vision tower "can't run in fp8"; that was wrong, and
@@ -169,8 +228,9 @@ def _load_qwen3_vl_model(
         apply_fp8_monkey_patch(model, sd, use_scaled_mm=False)
 
     info = model.load_state_dict(sd, strict=False, assign=True)
-    # Qwen3-VL-4B ties the LM head to the input embeddings (tie_word_embeddings=true), so the
-    # checkpoint omits lm_head.weight; re-tie after loading to materialize it.
+    # The 4B ties its LM head to the input embeddings (tie_word_embeddings=true), so its
+    # checkpoint omits lm_head.weight; re-tie after loading to materialize it. The 8B does
+    # NOT tie (it ships lm_head.weight in the checkpoint), so tie_weights() is a no-op there.
     model.tie_weights()
 
     unexpected = list(info.unexpected_keys)
@@ -196,12 +256,17 @@ def load_qwen3_vl_conditioner(
     device: torch.device | str = "cpu",
     max_length: int = TextEncoderConfig.max_length,
     select_layers: tuple[int, ...] = TextEncoderConfig.select_layers,
-    tokenizer_repo: str = QWEN3_VL_4B_INSTRUCT_REPO_ID,
+    tokenizer_repo: str | None = None,
     disable_mmap: bool = True,
+    is_8b: bool = False,
 ) -> "Qwen3VLConditioner":
-    """Load the Qwen3-VL-4B conditioner used by K2: weights from ``model_path`` (safetensors),
-    tokenizer from ``tokenizer_repo`` (Hub id or local dir)."""
-    qwen = _load_qwen3_vl_model(model_path, dtype=dtype, device=device, disable_mmap=disable_mmap)
+    """Load the Qwen3-VL conditioner used by K2: weights from ``model_path`` (safetensors),
+    tokenizer from ``tokenizer_repo`` (Hub id or local dir). ``is_8b`` switches the vendored
+    config (and the default tokenizer repo) to the 8B variant."""
+    if tokenizer_repo is None:
+        tokenizer_repo = QWEN3_VL_8B_INSTRUCT_REPO_ID if is_8b else QWEN3_VL_4B_INSTRUCT_REPO_ID
+    qwen = _load_qwen3_vl_model(model_path, dtype=dtype, device=device, disable_mmap=disable_mmap,
+                                is_8b=is_8b)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo, max_length=max_length)
     processor = Qwen2TokenizerFast.from_pretrained(tokenizer_repo, max_length=max_length)
     conditioner = Qwen3VLConditioner(qwen, tokenizer, processor, max_length=max_length,

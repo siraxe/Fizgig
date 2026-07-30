@@ -246,12 +246,15 @@ def load_krea2_text_encoder(
     max_length: Optional[int] = None,
     select_layers: Optional[tuple] = None,
     tokenizer_repo: Optional[str] = None,
+    is_8b: bool = False,
 ) -> "Qwen3VLConditioner":
-    """Load the Qwen3-VL-4B conditioner used by K2: weights from ``path`` (local safetensors,
-    ComfyUI or official key layout), tokenizer from ``tokenizer_repo`` (Hub id or local dir)."""
+    """Load the Qwen3-VL conditioner used by K2: weights from ``path`` (local safetensors,
+    ComfyUI or official key layout), tokenizer from ``tokenizer_repo`` (Hub id or local dir).
+    ``is_8b`` selects the vendored 8B config (and the matching default tokenizer repo)."""
     # Lazy: pulls in transformers' Qwen3-VL classes only when an encoder is actually loaded.
     from fizgig.krea2.embedder import (
         QWEN3_VL_4B_INSTRUCT_REPO_ID,
+        QWEN3_VL_8B_INSTRUCT_REPO_ID,
         TextEncoderConfig,
         load_qwen3_vl_conditioner,
     )
@@ -261,7 +264,7 @@ def load_krea2_text_encoder(
     if select_layers is None:
         select_layers = TextEncoderConfig.select_layers
     if tokenizer_repo is None:
-        tokenizer_repo = QWEN3_VL_4B_INSTRUCT_REPO_ID
+        tokenizer_repo = QWEN3_VL_8B_INSTRUCT_REPO_ID if is_8b else QWEN3_VL_4B_INSTRUCT_REPO_ID
     return load_qwen3_vl_conditioner(
         path,
         dtype=dtype,
@@ -269,6 +272,7 @@ def load_krea2_text_encoder(
         max_length=max_length,
         select_layers=select_layers,
         tokenizer_repo=tokenizer_repo,
+        is_8b=is_8b,
     )
 
 
