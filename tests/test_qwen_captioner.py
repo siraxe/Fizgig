@@ -13,7 +13,8 @@ sys.path.insert(0, os.path.join(REPO, "src"))
 import tkinter as tk
 import lora_trainer_gui as G
 from fizgig.krea2.embedder import (CAPTION_TASKS, DEFAULT_CAPTION_TASK,
-                                   ENCODE_SYSTEM_DESCRIPTOR, CAPTION_INSTRUCTION)
+                                   ENCODE_SYSTEM_DESCRIPTOR, CAPTION_INSTRUCTION,
+                                   SUBJECT_RULE, _strip_caption_preamble)
 
 G.LAST_USED_FILE = os.path.join(os.environ["TEMP"], "nope", ".last_used.json")
 
@@ -53,8 +54,11 @@ g.caption_model_var.set(G.QWEN_CAPTION_MODEL)
 g._on_caption_model_changed()
 root.update()
 qwen_tasks = list(g.caption_task_combo.cget("values"))
-ck("Qwen selected -> 4 presets + Custom", len(qwen_tasks) == 5 and qwen_tasks[-1] == G.QWEN_CUSTOM_TASK,
+ck("Qwen selected -> every shipped preset + Custom",
+   len(qwen_tasks) == len(CAPTION_TASKS) + 1 and qwen_tasks[-1] == G.QWEN_CUSTOM_TASK,
    qwen_tasks)
+ck("  both style presets are offered",
+   {CAPTION_TASKS["style"][0], CAPTION_TASKS["style_named"][0]} <= set(qwen_tasks), qwen_tasks)
 ck("  default task is the doctrine one",
    g.caption_task_var.get() == CAPTION_TASKS[DEFAULT_CAPTION_TASK][0], g.caption_task_var.get())
 ck("  Edit instructions button shown", bool(g.caption_edit_instr_btn.winfo_manager()))
@@ -103,6 +107,46 @@ ck("  edited flag is per preset",
    g._caption_task_is_edited(_TR) and not g._caption_task_is_edited(_SH))
 ck("  builtin_only always returns the shipped text",
    g._caption_instruction_for_task(_TR, builtin_only=True) == CAPTION_TASKS["training"][1])
+
+# --- 3c. the style presets say the opposite of the identity ones --------------------------
+# Both assertions guard against the same accident: writing a style preset by copy-pasting an
+# identity one. SUBJECT_RULE can only produce 'a woman'/'a man'/'a girl'/'a boy', which is wrong
+# for a dataset of landscapes and objects; and lighting must NOT be captioned for a style, or the
+# look only fires under the lighting it was trained on. The four identity presets ask for lighting
+# correctly — there it varies and you want it steerable — so the two rules genuinely coexist.
+for _k in ("style", "style_named"):
+    _instr = CAPTION_TASKS[_k][1]
+    ck(f"  '{_k}' does not use the person-only subject rule", SUBJECT_RULE not in _instr)
+    # "lighting" may appear only inside the exclusion list, never as something to describe.
+    ck(f"  '{_k}' never asks for lighting",
+       "lighting" not in _instr.lower().split("say nothing about")[0])
+    ck(f"  '{_k}' excludes the style itself", "never how it was made" in _instr)
+    # The framing, not the blocklist, is what generalises: a layered paper-cut set was described
+    # as "layered mountains" / "arranged in layered depth" in 4 of 9 captions while the rule only
+    # banned art-technique words. Measured 4/9 -> 0/9 once this clause was added.
+    ck(f"  '{_k}' says to describe the scene as real", "as if it were real" in _instr)
+    ck(f"  '{_k}' blocks construction artefacts too", "layers" in _instr and "stacking" in _instr)
+# The style phrase is trailing, not leading: 'in X style' gives a made-up token a role the model
+# already understands, which a bare token or a leading phrase does not.
+ck("  only the named preset names a look", "in mystyle style" in CAPTION_TASKS["style_named"][1]
+   and "mystyle" not in CAPTION_TASKS["style"][1])
+ck("  ...and names it at the END, not the start",
+   CAPTION_TASKS["style_named"][1].index("end the sentence with the exact words")
+   > CAPTION_TASKS["style_named"][1].index("what is depicted and what it is doing"))
+# 'short' is excluded: it is a single clause (subject, action, setting) and never asked for
+# lighting in the first place — nothing to preserve there.
+for _k in ("training", "detailed", "exhaustive"):
+    ck(f"  identity preset '{_k}' still asks for lighting", "lighting" in CAPTION_TASKS[_k][1])
+
+# Putting the phrase at the end also puts it out of reach of _strip_caption_preamble, which only
+# matches at the start. That is a real safety property of the trailing form, not an accident: a
+# LEADING phrase can be silently eaten (see the negative case below), which would delete the style
+# from every caption with nothing to show it had happened.
+for _phrase in ("in mystyle style", "in oil painting style", "in the image style"):
+    ck(f"  trailing phrase '{_phrase}' is untouched by preamble stripping",
+       _strip_caption_preamble(f"a red car parked on a street, {_phrase}").endswith(_phrase))
+ck("  ...whereas a LEADING 'the image is a' would have been stripped",
+   not _strip_caption_preamble("the image is a watercolour of a red car").startswith("the image"))
 
 # auto-recaption maps attempt 1 -> Training caption, attempt 2 -> Exhaustive detail.
 # Never "whatever the tab is set to".

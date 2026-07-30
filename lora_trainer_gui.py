@@ -772,18 +772,18 @@ def _persist_disabled() -> bool:
 
 
 def _running_on_pod() -> bool:
-    """True when this is the Docker pod image (RunPod, Vast, or any rented box).
+    """True when this is the Docker pod image (RunPod, or any rented box).
 
     Keyed off OUR marker, set in docker/entrypoint.sh, rather than RunPod's RUNPOD_POD_ID: the
-    hosting provider's variable names are theirs to change, and Vast sets none of them. The pod
-    id below is read separately and only used for display and for targeting a stop — everything
-    degrades if it is absent."""
+    hosting provider's variable names are theirs to change, and another host would set different
+    ones entirely. The pod id below is read separately and only used for display and for targeting
+    a stop — everything degrades if it is absent."""
     return os.environ.get("FIZGIG_POD", "0") not in ("0", "", None)
 
 
 def _pod_id() -> str:
     """The provider's id for this pod, or "" if it doesn't advertise one."""
-    for key in ("RUNPOD_POD_ID", "VAST_CONTAINERLABEL", "HOSTNAME"):
+    for key in ("RUNPOD_POD_ID", "HOSTNAME"):
         v = (os.environ.get(key) or "").strip()
         if v:
             return v
@@ -2239,10 +2239,14 @@ class LoRATrainerGUI:
         return banner
 
     def _add_youtube_help_button(self, parent, tab_key="start", prominent=False):
-        """Add a 'Get help on YouTube' button at the bottom of a tab's outer frame.
+        """Add a 'Tutorial' button at the bottom of a tab's outer frame.
+
+        Labelled just "Tutorial" rather than "Get help on YouTube": the play glyph and the red
+        already say where it goes, and "get help" reads as troubleshooting when these are walk-
+        throughs. Shorter also keeps the Start tab's button row on one line.
 
         `tab_key` selects the URL from help.json's `youtube_urls` dict.
-        `prominent=True` uses a larger button with a hint about per-tab help (for the Start tab).
+        `prominent=True` uses a larger button and the Start tab's extra buttons alongside.
         """
         # Used only when help.json is missing or unreadable — point it at the real guide
         # rather than the old joke URL, since that path fires on a genuine error.
@@ -2258,7 +2262,7 @@ class LoRATrainerGUI:
         row = tk.Frame(btn_frame, bg=COLORS["bg_deep"])
         row.pack(anchor=tk.W)
         btn = tk.Button(
-            row, text="\u25b6  Get help on YouTube",
+            row, text="\u25b6  Tutorial",
             font=(FONT_FAMILY, 12 if prominent else 10, "bold"),
             fg="#FFFFFF", bg="#CC0000", activeforeground="#FFFFFF", activebackground="#990000",
             relief="flat", bd=0, padx=20 if prominent else 16,
@@ -2276,6 +2280,17 @@ class LoRATrainerGUI:
                     "https://buymeacoffee.com/lorasandlenses"),
             )
             coffee.pack(side=tk.LEFT, padx=(12, 0))
+            # Shown on a pod too, deliberately: the Preferences card already tells a pod user they
+            # are on one, and a user who is happy renting is exactly who might send the link on.
+            # RunPod's own violet, so it reads as theirs rather than as another Fizgig action.
+            runpod = tk.Button(
+                row, text="⚡  Deploy on RunPod",
+                font=(FONT_FAMILY, 12, "bold"),
+                fg="#FFFFFF", bg="#7C3AED", activeforeground="#FFFFFF", activebackground="#6D28D9",
+                relief="flat", bd=0, padx=20, pady=6, cursor="hand2",
+                command=lambda: __import__("webbrowser").open(self._runpod_deploy_url()),
+            )
+            runpod.pack(side=tk.LEFT, padx=(12, 0))
             about = tk.Button(
                 row, text="About",
                 font=(FONT_FAMILY, 12, "bold"),
@@ -12758,9 +12773,13 @@ class LoRATrainerGUI:
     # Until then the desktop card says "coming soon" instead of offering a button that goes
     # nowhere — so this can ship long before the template does. test_runpod_card.py refuses to
     # let LIVE be True while the URL is still the placeholder.
-    RUNPOD_TEMPLATE_LIVE = False
+    RUNPOD_TEMPLATE_LIVE = True
     RUNPOD_GUIDE_URL = ("https://github.com/shootthesound/Fizgig/blob/master/docker/README.md")
-    RUNPOD_DEPLOY_URL = "https://runpod.io/console/deploy?template=fizgig"
+    # Pre-selects an RTX 5090: it is the cheapest card that clears Fizgig's 32 GB
+    # no-block-swap threshold for Krea 2, so the default lands people on the fastest
+    # sensible option rather than the biggest or the cheapest.
+    RUNPOD_DEPLOY_URL = ("https://console.runpod.io/deploy"
+                         "?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um")
     RUNPOD_REFERRAL = "vkb387ep"
 
     def _runpod_deploy_url(self) -> str:
@@ -12793,7 +12812,8 @@ class LoRATrainerGUI:
         tk.Label(card,
                  text="Only after a run completes on its own — never after a Pause, a Stop, or a "
                       "failure, since those are exactly the times you want the machine alive. You "
-                      "get a two-minute countdown you can cancel.",
+                      "get a two-minute countdown you can cancel. This stops the pod, it never "
+                      "terminates it, so your files are still here when you start it again.",
                  font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"],
                  bg=COLORS["bg_surface"], wraplength=760,
                  justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 2))
@@ -12837,6 +12857,8 @@ class LoRATrainerGUI:
                  text="Your files: datasets in /workspace/datasets, models in /workspace/models, "
                       "finished LoRAs in /workspace/output_loras. Everything under /workspace "
                       "survives stopping and restarting the pod — anything outside it does not. "
+                      "On the default Volume Disk it goes when you TERMINATE the pod, so stop "
+                      "rather than terminate between sessions; a Network Volume survives that too. "
                       "Drag files in and out with the file manager on port 8080.",
                  font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
                  wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(10, 0))
@@ -12864,7 +12886,9 @@ class LoRATrainerGUI:
         if bits:
             _gpu = (os.environ.get("RUNPOD_GPU_NAME") or "").replace("+", " ").strip()
             line = "  ·  ".join(bits) + (f"  ·  {_gpu}" if _gpu else "")
-            tk.Label(card, text=line, font=(FONT_FAMILY, 8), fg=COLORS["text_muted"],
+            # Readable tier despite being a footer: this is the one line a user is asked to
+            # transcribe into a bug report, so 8pt at 2.54:1 was exactly backwards.
+            tk.Label(card, text=line, font=(FONT_FAMILY, 9), fg=COLORS["text_explain"],
                      bg=COLORS["bg_surface"], wraplength=760,
                      justify=tk.LEFT).pack(anchor=tk.W, pady=(10, 0))
 

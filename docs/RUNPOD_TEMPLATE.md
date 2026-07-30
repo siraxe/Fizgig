@@ -15,12 +15,19 @@ Here they are choosing what to rent, and the appeal is getting a bigger card tha
 Train, profile, repair and extract LoRAs for **Flux 2 Klein 9B** and **Krea 2** — the full desktop
 app in your browser, on whatever GPU you feel like renting.
 
-## Before you deploy
+## Storage
 
-**Attach a Network Volume (100 GB+) at `/workspace`.**
+**Give it 100 GB+, mounted at `/workspace`.** The models are ~45 GB, plus your datasets and the
+LoRAs you train.
 
-Not the template's *Volume Disk* — that one is deleted when you terminate the pod, taking ~45 GB of
-downloaded models with it. A Network Volume outlives any pod, so you download the models once.
+The default **Volume Disk** is fine. Just know that **stopping a pod keeps everything, terminating
+it does not** — so stop between sessions and your models, datasets and LoRAs are waiting when you
+come back. Download the models once and every future session reuses them.
+
+A **Network Volume** is optional, and the upgrade if you want it: separate storage that outlives any
+pod, so you can terminate freely and reattach it later. It is region-locked, though, and that region
+may not have the GPU you want — if you can't get both, take the Volume Disk and stop rather than
+terminate.
 
 ## What you get
 
@@ -33,19 +40,27 @@ downloaded models with it. A Network Volume outlives any pod, so you download th
 
 ## Logging in
 
-Both ports ask for a username and password:
+**Give it a few minutes first.** RunPod downloads the image before anything can start, and it's a
+big one. Until that finishes the links are dead — the pod looks ready and both ports give you
+nothing. That's normal on a first deploy, and the **Logs** tab shows the download running.
+
+You're ready when the log reaches `[fizgig] Starting KasmVNC display`.
+
+Both ports then ask for a username and password:
 
 | | Port | Username | Password |
 |---|---|---|---|
-| **Fizgig** | 6080 | `fizgig` | see below |
+| **Fizgig** | 6080 | `fizgig` | your `VNC_PASSWORD` |
 | **File manager** | 8080 | `admin` | the same one |
 
-**The password is in the pod log.** Fizgig generates a fresh one for every pod and prints it at
-startup — open the pod's log and copy it.
+**Set your own password when you deploy** — it saves you hunting for one later. On the deploy
+screen expand **Edit Template → Environment Variables**, add `VNC_PASSWORD`, and pick something
+**12+ characters**. Shorter ones get zero-padded for the file manager, which requires 12, so 12+
+keeps both logins identical.
 
-**Want your own instead?** On the deploy screen expand **Edit Template → Environment Variables**
-and set `VNC_PASSWORD` before launching. Use 12+ characters: shorter ones get zero-padded for the
-file manager, and the log tells you what it ended up as.
+**Didn't set one?** Fizgig generates one per pod and prints it at the **end of the log**, in the
+"Ready" banner. If the log seems to stop short of it, switch to another tab and back; RunPod's log
+view sometimes needs a nudge before it shows the newest lines.
 
 ## First run
 
@@ -61,12 +76,15 @@ back later, the run is still going.
 
 Environment variables — set them on the deploy screen under **Edit Template**.
 
-| Variable | |
-|---|---|
-| `VNC_PASSWORD` | Desktop *and* file manager. **12+ characters.** |
-| `HF_TOKEN` | Klein only. Krea 2 needs nothing. |
-| `FETCH_MODELS` | e.g. `tools,krea2` to download at boot instead of in the app. |
-| `FIZGIG_REF` | Branch or tag of Fizgig to run. Defaults to `master`, so the app updates itself at every pod start regardless of the image version. |
+All optional — the defaults are the intended setup, and everything here can be done from inside the
+app instead.
+
+| Variable | Values | |
+|---|---|---|
+| `VNC_PASSWORD` | **12+ characters** | Desktop *and* file manager. Generated per pod if unset. |
+| `HF_TOKEN` | `hf_…` | Only needed for Klein, which is gated. Krea 2 needs nothing. |
+| `FETCH_MODELS` | `krea2`, `klein`, `tools` — comma-separated | Download at boot instead of clicking the button in Preferences. `tools` is the Florence-2 captioner, the EN→ZH translator and the face model. |
+| `FIZGIG_REF` | branch or tag | Which Fizgig to run. Defaults to `master`, so the app updates itself at every pod start regardless of the image version. |
 
 To enable auto-stop, paste a RunPod API key into **Preferences → RunPod** inside the app. Don't put
 one in a template — template variables reach every container deployed from it.

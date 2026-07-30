@@ -6,7 +6,12 @@
 </p>
 
 <p align="center">
+  <a href="https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um&ref=vkb387ep"><img src="https://img.shields.io/badge/⚡%20Deploy%20on%20RunPod-673AB7?style=for-the-badge&logoColor=white" alt="Deploy Fizgig on RunPod"></a>
   <a href="https://buymeacoffee.com/lorasandlenses"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a>
+</p>
+<p align="center">
+  <sub>No GPU, or want a bigger one? Fizgig runs on rented hardware — one click, nothing to install.<br>
+  Deploying through that link supports Fizgig's development at no extra cost to you.</sub>
 </p>
 
 <p align="center">
@@ -149,7 +154,10 @@ The browser gallery of training samples now *measures* the run instead of just s
 - **Training Run Visualiser** — scrub the current run epoch by epoch, Royale-style: a slider carousel per sample prompt, play/pause with ping-pong looping, likeness score inline, and share-ready export — a WebM clip with the epoch ticker and Fizgig tag burned in, or full-res PNG frames. It's a taste of the **LoRA Royale** tab, right in the browser.
 
 ### Dataset prep
-- **AI captioning, with the captioner that trains your model** — if you have Krea 2's Qwen3-VL text encoder, the Captions tab uses it by default. It's the same vision-language model that conditions training, so it captions to the doctrine that actually matters for LoRAs: name the camera viewpoint, say whether the face is visible, describe what's there instead of hedging. Four tasks (training caption / short / detailed / exhaustive) — and **every one of them is an editable preset, not a fixed mode**. Open the instruction the model is actually given, rewrite it in plain English, and save it; each preset keeps its own wording, your edits persist between sessions, and a Reset button restores the built-in whenever you want it back. Tune one preset for products and another for portraits and just switch between them. The trainer's mid-run auto-recaption picks up your edited wording too, so a caption style you settle on is the style the run keeps writing. **Florence-2** remains the zero-setup option, downloading itself on first use. Either way it's bulk-generate in one click, with your trigger word prepended.
+- **AI captioning, with the captioner that trains your model** — if you have Krea 2's Qwen3-VL text encoder, the Captions tab uses it by default. It's the same vision-language model that conditions training, so it captions to the doctrine that actually matters for LoRAs: name the camera viewpoint, say whether the face is visible, describe what's there instead of hedging. Six tasks — and **every one of them is an editable preset, not a fixed mode**.
+
+  Four are for training a subject: **training caption** (the default — viewpoint-aware), **short**, **detailed** and **exhaustive**. Two are for training a *look*, and they work the opposite way round: a style caption describes only what changes from image to image and never the style itself, because the style is the constant you're training and describing it in different words each time scatters it. **Style — in X style** writes `…a river through a desert, in mystyle style` and you edit that phrase to whatever names your look; **Style — content only** leaves it out entirely so your trigger word carries it. Use one or the other, not both. Neither describes lighting, medium or brushwork, and both name a landscape or an object as concretely as they'd name a person.
+ Open the instruction the model is actually given, rewrite it in plain English, and save it; each preset keeps its own wording, your edits persist between sessions, and a Reset button restores the built-in whenever you want it back. Tune one preset for products and another for portraits and just switch between them. The trainer's mid-run auto-recaption picks up your edited wording too, so a caption style you settle on is the style the run keeps writing. **Florence-2** remains the zero-setup option, downloading itself on first use. Either way it's bulk-generate in one click, with your trigger word prepended.
 
   The text encoder slot is **open**: bf16, the smaller **fp8_scaled** (recommended — 4.9 GB resident vs 8.3 GB, output we couldn't tell apart), or a **community fine-tune / abliterated build**. Because the same model writes your captions, swapping it changes how your dataset gets described — useful when a stock instruct model hedges on or refuses your subject matter.
 - **Bilingual captions** — optionally append Chinese via Helsinki-NLP. Klein's Qwen3 text encoder has deep Chinese training, so bilingual captions act as text-level data augmentation, improving visual quality without changing loss. In a controlled A/B (same data, seed, and hyperparameters — captions the only change) the loss curves stayed within ±0.001/epoch, yet the bilingual run produced visibly more skin detail and faster visual convergence.
@@ -174,7 +182,7 @@ the pod **shut itself down when training finishes** so an overnight run doesn't 
 Your models and datasets live on persistent storage, so you download them once and every future
 session picks up where you left off.
 
-**[Running Fizgig on a rented GPU →](docker/README.md)**
+**[⚡ Deploy on RunPod →](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um&ref=vkb387ep)**  ·  [Read the guide first](docker/README.md)
 
 ---
 

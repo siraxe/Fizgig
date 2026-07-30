@@ -1,167 +1,157 @@
 # Running Fizgig on a rented GPU
 
-Fizgig is a desktop app, not a web app. This image gives it a virtual screen and streams that
-screen to your browser, so what you get is the whole workbench — Repair Studio, Explorer, Royale,
-the sample gallery — rather than a cut-down web version of the trainer.
+[**⚡ Deploy Fizgig on RunPod →**](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um&ref=vkb387ep)
 
-```
-your browser  ──HTTP :6080──▶  KasmVNC (X server + web server in one)
-                                   └── openbox + Fizgig
-```
+The whole app in a browser tab — Training, Repair Studio, LoRA the Explorer, LoRA Royale, Profiler,
+Extract and the sample gallery. Nothing to install, and your own GPU stays free while it trains.
 
-KasmVNC rather than the usual Xvfb + x11vnc + noVNC stack: it encodes in **WebP**, multi-threaded,
-and drops quality while you drag then restores it when you stop. The plain stack was noticeably
-laggy over a link to a rented GPU and had no tuning left client-side. It also **resizes the desktop
-to match your browser window**, so there is no screen size to guess at.
+*That link is a referral one — it supports Fizgig's development at no extra cost to you.*
 
-## RunPod
+---
 
-**Template settings** — field names as they appear in RunPod's *Edit template* dialog:
+## Storage
 
-| Field | Value |
-|---|---|
-| Template name | `Fizgig` |
-| Template type | Pods |
-| Compute type | NVIDIA · GPU |
-| Container image | `ghcr.io/shootthesound/fizgig:2.13.0` — a **version** tag, see below |
-| Container disk | `25` GB |
-| Persistent storage | **Network storage** — pick your volume from the dropdown |
-| Persistent storage mount path | `/workspace` |
+**Give it 100 GB+, and mount it at `/workspace`.** The models are ~45 GB, and you want room for
+datasets and output LoRAs on top.
 
-**Pin a version, don't use `:latest`.** RunPod caches images on the host, so pushing a new
-`:latest` can leave workers running a stale one with no way to tell — which is their own
-recommendation, and it makes a bug report impossible to place against a version.
+Then the one thing to know: **stopping a pod keeps everything; terminating it does not.** Stop
+between sessions and your models, datasets and LoRAs are all still there when you start it again.
+Terminate and the disk goes with the pod.
 
-That costs less here than it usually does: Fizgig's source is pulled from git at every pod start,
-so app updates reach users whatever the image tag says. The image only changes when system packages
-or Python dependencies do. Bump the tag when a release changes those; otherwise leave it.
+That's it for the default **Volume Disk**, which is what the template comes with and is perfectly
+fine to use.
 
-Every release publishes `X.Y.Z`, `X.Y` and `latest` — pick the full version.
+A **Network Volume** is the upgrade if you want one: it's a separate thing that outlives any pod, so
+you can terminate freely and attach the same storage to a new pod later. The catch is that it's
+region-locked, and the region you create it in may not have the GPU you want — so if you can't find
+a region with both, don't fight it. Take the Volume Disk and just stop rather than terminate.
 
-Under **Networking configuration → HTTP Ports**, add two. The labels show up in the pod's Connect
-menu, so name them:
+Either way, download the models once and every future session reuses them.
 
-| Label | Port |
-|---|---|
-| `Fizgig` | `6080` |
-| `File Manager` | `8080` |
+## Which GPU
 
-No TCP ports, no start command, and no registry authentication — the image is public.
+The link defaults to an **RTX 5090**, and that's a deliberate choice rather than "the newest one".
 
-**Leave Environment variables empty on a public template.** RunPod warns in that panel that they
-are not encrypted, and a public template hands them to everyone who deploys it — a `VNC_PASSWORD`
-set here would become the shared password for every pod created from it. Fizgig generates a unique
-one per pod instead and prints it in the log.
+Fizgig sizes Krea 2's block swap to your VRAM, and **at 32 GB it uses none at all**. Block swap
+moves weights over PCIe every step and costs roughly **4× the step time**. When you're billed by the
+hour, a card that's slightly dearer but four times faster is much cheaper per finished LoRA.
 
-**Use a Network Volume, not the template's Volume Disk.** The difference only bites at
-termination, and it bites hard:
-
-| | Stop the pod | **Terminate** the pod |
+| | Cards | |
 |---|---|---|
-| **Volume Disk** (created with the pod) | kept | **deleted with the pod** |
-| **Network Volume** (a separate resource) | kept | **kept** |
+| **Best** | RTX 5090 (32 GB), L40S / A6000 (48 GB) | Krea 2 with no block swap |
+| **Good value** | RTX 4090, 3090, A5000 (24 GB) | Swaps for Krea 2; ideal for Klein 9B |
+| **Smallest worth renting** | 16 GB | Fine, but heavy swap makes it false economy by the hour |
 
-RunPod's own wording for Volume Disk is "tied to the Pod's lifecycle" — terminate takes it, and
-your ~45 GB of models with it. That matters more than it sounds, because **every image update
-requires terminating and redeploying**, so on a Volume Disk you re-download the models each time.
+H100 and A100 work but are poor value here — LoRA training never touches 80 GB, and you'd pay
+several times more for it.
 
-Create the Network Volume first (Storage → Network Volumes), then pick it when you deploy. Two
-trade-offs: it is billed per GB/month whether or not a pod is running, and it is region-locked,
-which fixes the set of GPUs you can rent.
+## Logging in
 
-**Environment variables**
+**Give it a few minutes first.** RunPod has to download the image before anything can start, and
+it's a big one. Until that finishes the links are dead — the pod looks ready, the ports are listed,
+and both give you nothing. That's normal on a first deploy; the **Logs** tab shows the download
+running.
 
-| Variable | Default | What it does |
-|---|---|---|
-| `VNC_PASSWORD` | *generated* | Password for the browser session **and** the file manager. If unset, one is generated and printed to the pod log — **set your own**. Use **12+ characters**: the file manager rejects anything shorter, and a short password gets silently padded with `0`s (the pod log tells you what it ended up as). |
-| `FETCH_MODELS` | *(empty)* | Comma-separated families to download before launch, e.g. `tools,krea2`. Left empty on purpose: pulling tens of GB unasked spends your money, possibly on the family you didn't want. Use the button in Preferences instead. |
-| `HF_TOKEN` | — | Only needed for Klein. Krea 2's files aren't gated. |
-| `RUNPOD_STOP_API_KEY` | *Optional.* Enables *stop the pod when training finishes*. Normally you paste the key into **Preferences → RunPod** instead, which saves it to your volume — **never put a key in a shared template**, since template variables are handed to every container deployed from it. Must be an **account** key (RunPod → Settings → API Keys); the one RunPod injects into a pod is pod-scoped and 403s on pod-management calls, which is a known RunPod limitation rather than a Fizgig one. |
-| `FIZGIG_REF` | `master` | Branch or tag to run. Pin it if you want a fixed version. |
-| `SCREEN_W` / `SCREEN_H` | `1600` / `1400` | Only the *starting* size — the desktop resizes to match your browser window, so this rarely matters. |
+You're in business when the log reaches:
 
-### Getting files in and out
-
-Port **8080** is a drag-and-drop file manager ([filebrowser](https://filebrowser.org/)) rooted at
-`/workspace`. Log in as **`admin`** with your `VNC_PASSWORD`. Drag a dataset folder from your desktop
-into a browser tab, and download finished LoRAs from `output_loras/` the same way — no terminal, no
-SSH keys, no CLI.
-
-If you'd rather use a terminal, **`runpodctl`** is preinstalled:
-
-```bash
-# on the pod, to send a finished LoRA to your machine
-runpodctl send /workspace/output_loras/mylora.safetensors
-# then on your machine, with the code it prints
-runpodctl receive <code>
 ```
-
-`scp` and `rsync` over RunPod's SSH also work, and rsync is the better choice for a large dataset
-since it resumes and syncs incrementally.
-
-**First run**
-
-1. Open the pod's HTTP `6080` endpoint and log in.
+[fizgig] Starting KasmVNC display (1600x1400, resizes to your browser window)
+```
 
 | | Port | Username | Password |
 |---|---|---|---|
-| **Fizgig** | 6080 | `fizgig` | see below |
+| **Fizgig** | 6080 | `fizgig` | your `VNC_PASSWORD` |
 | **File manager** | 8080 | `admin` | the same one |
 
-   The password is in the pod log: by default Fizgig generates a fresh one per pod and prints it
-   there. Also logged is the zero-padded version the file manager uses when your password is under 12 characters.
+**Set your own password when you deploy.** On the deploy screen expand **Edit Template →
+Environment Variables**, add `VNC_PASSWORD`, and pick something 12+ characters. Then you already
+know it, and you never have to go looking.
 
-   To choose your own, set `VNC_PASSWORD` on the deploy screen under **Edit Template →
-   Environment Variables** before launching.
-2. Fizgig is already running. Go to **Preferences → ⬇ Download models for me**.
-   Krea 2 needs no HuggingFace account; Klein will ask for a token.
-3. Point the **Start** tab at a dataset folder and train.
+Anything shorter gets zero-padded for the file manager, which needs 12 — so choose 12+ and both
+logins stay identical.
 
-Models land in `/workspace/models`, LoRAs in `/workspace/output_loras`, both on the volume.
+**Didn't set one?** Fizgig generates one per pod and prints it at the **end of the log**, in the
+"Ready" banner:
 
-## GPU sizing
-
-Krea 2 trains on **8 GB** with everything on Auto and batch size 1, so the cheap end of the GPU
-list is genuinely usable. 10–12 GB gives headroom to raise batch size or resolution. Klein 9B wants
-16 GB. See the [VRAM guidance](../README.md#vram-guidance).
-
-## Vast.ai
-
-Same image. Set the Docker image, expose port `6080`, mount storage at `/workspace`, and pass the
-same environment variables. Vast's on-start script equivalent needs nothing extra — the entrypoint
-handles everything.
-
-## Running it locally
-
-Any machine with Docker and an NVIDIA GPU:
-
-```bash
-docker run --gpus all -p 6080:6080 \
-  -v fizgig-data:/workspace \
-  -e VNC_PASSWORD=changeme \
-  ghcr.io/shootthesound/fizgig:2.13.0
+```
+[fizgig]  Your browser will ask for a username and password:
+[fizgig]      username: fizgig
+[fizgig]      password: ...
 ```
 
-Then open <http://localhost:6080/vnc.html>.
+If the log looks like it stops short of that, switch to another tab and back — RunPod's log view
+sometimes needs a nudge before it shows the newest lines.
 
-## Building it yourself
+## First run
 
-```bash
-docker build -f docker/Dockerfile -t fizgig .
+1. Connect on **port 6080** and log in
+2. **Preferences → ⬇ Download models for me** — Krea 2 is ~45 GB and needs no HuggingFace account;
+   Klein is gated by Black Forest Labs and will ask for a free token
+3. Open **port 8080** and drag a dataset folder into `/workspace/datasets`
+4. **Start tab → Browse** → pick it, then **Training → Start**
+
+Closing the browser tab does **not** stop training. Fizgig runs on the pod — shut the tab, come back
+later, the run is still going.
+
+## Getting files in and out
+
+**Port 8080** is a file manager rooted at `/workspace`. Drag a dataset folder in from your desktop,
+download finished LoRAs from `output_loras/` the same way. No terminal, no SSH keys.
+
+Prefer a terminal? `runpodctl` is preinstalled — `runpodctl send <path>` on the pod, then
+`runpodctl receive <code>` on your machine. `scp` and `rsync` over SSH work too, and rsync is the
+better bet for a large dataset since it resumes.
+
+## Where things live
+
+```
+/workspace/datasets/      your training images (one folder per LoRA)
+/workspace/models/        the weights
+/workspace/output_loras/  finished LoRAs
 ```
 
-The image holds system packages and pip dependencies only. **Fizgig's source is cloned at boot**,
-not baked in — so a new release reaches users on their next pod start without an image rebuild or a
-10 GB re-pull. Rebuild only when `requirements.txt` changes; CI does this automatically on release
-tags.
+Everything under `/workspace` persists. Anything outside it is wiped when the pod stops.
 
-Model weights aren't baked in either. Klein's repos are gated because Black Forest Labs require
-each user to accept the licence personally, and shipping those weights in a public image would
-bypass that. Both families together are also ~80 GB — slower to pull as an image layer than to
-fetch from HuggingFace directly.
+## Stopping the pod when a run finishes
 
-## Security
+A rented GPU bills by the hour, so a run that ends at 4am keeps billing until you notice.
+**Preferences → RunPod → Stop this pod when a training run finishes** fixes that. You get a
+two-minute countdown you can cancel, and it never fires after a Pause, a Stop or a failure — those
+are exactly the times you want the machine alive.
 
-The VNC session is a full desktop on your pod: anyone who reaches it can use the GPU and read the
-volume. Always set `VNC_PASSWORD`. Port `5900` (raw, unencrypted VNC) is deliberately **not**
-exposed — only `6080`, which the host serves over HTTPS.
+It needs an API key, pasted into that same panel. Make one at **RunPod → Settings → API Keys**; the
+key RunPod gives a pod automatically is pod-scoped and cannot stop pods, which is a RunPod
+limitation rather than a Fizgig one. It's stored on your volume, not in any template.
+
+## Settings
+
+Environment variables, set on the deploy screen under **Edit Template**:
+
+| Variable | Values | |
+|---|---|---|
+| `VNC_PASSWORD` | 12+ characters | Desktop *and* file manager. Generated per pod if unset. |
+| `HF_TOKEN` | `hf_…` | Only needed for Klein, which is gated. Krea 2 needs nothing. |
+| `FETCH_MODELS` | `krea2`, `klein`, `tools` — comma-separated | Download at boot instead of clicking the button in Preferences. `tools` is the Florence-2 captioner, the EN→ZH translator for bilingual captions, and the face model the Look Filter uses. |
+| `FIZGIG_REF` | branch or tag | Which Fizgig to run. Defaults to `master`, so the app updates itself at every pod start. |
+
+Nothing is compulsory — the defaults are the intended setup, and everything here can be done from
+inside the app instead.
+
+Three more exist for unusual cases: `FETCH_MODELS_EXTRA` passes extra flags to the downloader,
+`FIZGIG_REPO` points the pod at a fork, and `SCREEN_W`/`SCREEN_H` set the desktop's *starting* size
+(1600×1400) — which rarely matters, since it then resizes to your browser window.
+
+## If something's wrong
+
+The **pod log** is the first place to look — every step is narrated there, including storage and the
+login details.
+
+- **Both links dead just after deploying** — it's still downloading the image. Wait for
+  `Starting KasmVNC display` in the log.
+- **Storage shows ~25 GB** — the volume didn't mount. Check the mount path is `/workspace`.
+- **Downloads fail with "no space left"** — same cause: models are landing on container disk.
+- **Your models vanished** — the pod was *terminated* rather than *stopped*. A Volume Disk goes
+  with its pod; stop it instead, or use a Network Volume if you need to terminate.
+
+Fizgig's own version and the image's are both shown in **Preferences → RunPod**; quote both if you
+report a problem, since the app updates itself independently of the image.

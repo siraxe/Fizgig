@@ -70,3 +70,9 @@ docs/PERF_ROADMAP.md
 docs/PERF_CHANGES.md
 docs/bench_krea2_baseline.json
 /output
+
+# Internal design notes (not for publication)
+docs/PHONE_MONITOR_PLAN.md
+
+# Written by launch.pyw when the app fails to start
+launch_error.log
