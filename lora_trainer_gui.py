@@ -6986,20 +6986,25 @@ class LoRATrainerGUI:
         return results
 
     def add_prefix_to_captions(self):
-        """Prepend the Prefix/Suffix Text to every .txt caption in the image folder.
-        Captions that already start with it (ignoring leading whitespace) are skipped."""
+        """Prepend the Prefix/Suffix Text to every image's .txt caption in the image folder.
+        Missing or empty captions are seeded with just the text. Captions that already start
+        with it (ignoring leading whitespace) are skipped."""
         self._affix_captions(prefix=True)
 
     def add_suffix_to_captions(self):
-        """Append the Prefix/Suffix Text to every .txt caption in the image folder.
-        Captions that already end with it (ignoring trailing whitespace) are skipped."""
+        """Append the Prefix/Suffix Text to every image's .txt caption in the image folder.
+        Missing or empty captions are seeded with just the text. Captions that already end
+        with it (ignoring trailing whitespace) are skipped."""
         self._affix_captions(prefix=False)
 
     def _affix_captions(self, prefix: bool):
-        """Shared worker for add_prefix_to_captions / add_suffix_to_captions. Adds the text
-        with a single space separator to each .txt caption; skips ones that already have it
-        at the chosen end (checked on the stripped body so leading/trailing whitespace
-        doesn't defeat the dedupe). Trailing newlines are preserved."""
+        """Shared worker for add_prefix_to_captions / add_suffix_to_captions. Walks the image
+        files in the folder, deriving each caption as <basename>.txt next to the image. For
+        each image: if the .txt is missing, it is created with just the affix text; if it
+        exists but is empty, it is seeded with just the affix text; otherwise the affix is
+        added with a single space separator, skipping captions that already have it at the
+        chosen end (checked on the stripped body so leading/trailing whitespace doesn't defeat
+        the dedupe). Trailing newlines are preserved on non-empty captions."""
         folder = self.image_folder_var.get().strip() if hasattr(self, "image_folder_var") else ""
         if not folder or not os.path.isdir(folder):
             messagebox.showerror("Error", "Please select a valid folder")
@@ -7008,19 +7013,38 @@ class LoRATrainerGUI:
         if not text:
             messagebox.showerror("Error", "Please enter text to add")
             return
-        txt_files = glob.glob(os.path.join(glob.escape(folder), "*.txt"))
+        image_exts = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"}
+        try:
+            entries = sorted(os.listdir(folder))
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read folder: {e}")
+            return
+        image_files = [
+            os.path.join(folder, name) for name in entries
+            if os.path.splitext(name)[1].lower() in image_exts
+            and os.path.isfile(os.path.join(folder, name))
+        ]
         changed = 0
         skipped = 0
+        created = 0
         errors = 0
-        for txt_file in txt_files:
+        for img_file in image_files:
+            txt_file = os.path.splitext(img_file)[0] + ".txt"
             try:
+                if not os.path.exists(txt_file):
+                    # no caption yet — seed it with just the affix text
+                    with open(txt_file, "w", encoding="utf-8") as f:
+                        f.write(text)
+                    created += 1
+                    changed += 1
+                    continue
                 with open(txt_file, "r", encoding="utf-8") as f:
                     content = f.read()
                 stripped = content.strip()
                 if not stripped:
-                    skipped += 1   # empty caption — nothing meaningful to affix
-                    continue
-                if prefix:
+                    # empty caption — seed it with just the affix text (no separator)
+                    new_content = text
+                elif prefix:
                     if stripped.startswith(text):
                         skipped += 1
                         continue
@@ -7041,7 +7065,7 @@ class LoRATrainerGUI:
                 self.update_caption_log(f"Error processing {os.path.basename(txt_file)}: {e}\n")
         action = "Prepended" if prefix else "Appended"
         self.update_caption_log(
-            f"{action} '{text}' to {changed} caption(s); skipped {skipped} (already had it or empty)"
+            f"{action} '{text}' to {changed} caption(s) ({created} new); skipped {skipped} (already had it)"
             + (f"; {errors} error(s)" if errors else "") + "\n")
         if changed:
             self.refresh_caption_images()
@@ -18689,6 +18713,11 @@ class LoRATrainerGUI:
                 else:
                     image_dir = self.image_folder_var.get().strip().replace("\\", "/")
                     toml_lines.append(f'image_directory = "{image_dir}"')
+                    # Auto-detect a sibling "control" subfolder — schema supports control_directory but no UI exposes it.
+                    if image_dir:
+                        _ctrl_dir = image_dir.rstrip("/") + "/control"
+                        if os.path.isdir(_ctrl_dir):
+                            toml_lines.append(f'control_directory = "{_ctrl_dir}"')
 
             if cache_dir:
                 toml_lines.append(f'cache_directory = "{cache_dir.replace(chr(92), "/")}"')
