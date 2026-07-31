@@ -6228,6 +6228,16 @@ class LoRATrainerGUI:
         replace_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
         ttk.Button(replace_frame, text='Replace', command=replace_in_caption).pack(side=tk.LEFT, padx=5)
 
+        # Centre over the main window. Without this Tk leaves placement to the OS window
+        # manager, which on Windows parks new Toplevels at (0,0) — the top-left corner.
+        dialog.update_idletasks()
+        try:
+            px = self.master.winfo_rootx() + (self.master.winfo_width() - dialog.winfo_width()) // 2
+            py = self.master.winfo_rooty() + (self.master.winfo_height() - dialog.winfo_height()) // 3
+            dialog.geometry(f"+{max(0, px)}+{max(0, py)}")
+        except Exception:
+            pass
+
     # region Caption model selection (Florence-2 / Qwen3-VL)
 
     def _qwen_captioner_path(self) -> str:
