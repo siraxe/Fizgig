@@ -5895,12 +5895,14 @@ class LoRATrainerGUI:
         ttk.Button(fr_buttons, text="Replace in All .txt Files", command=self.find_replace_in_captions).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(fr_buttons, text="Preview Changes", command=self.preview_find_replace).pack(side=tk.LEFT)
 
-        # Card 4b: Add Prefix / Suffix — prepends/appends the Text to every caption,
-        # skipping ones that already start/end with it. Pads with a single space.
+        # Card 4b: Add Prefix / Suffix / Rename — prepends/appends the Text to every caption
+        # (skipping ones that already start/end with it), or renames every image + paired .txt
+        # to <Text>_<NNNN>.
         ps_card = self._start_section_card(
-            fr_ps_row, "Add Prefix / Suffix",
-            "Prepend or append the same text to every `.txt` caption in the image folder. "
-            "Skips captions that already start (or end) with it.",
+            fr_ps_row, "Add Prefix / Suffix / Rename",
+            "Prepend or append the same text to every `.txt` caption in the image folder "
+            "(skips captions that already start/end with it). 'Rename Files' renames every "
+            "image and its paired `.txt` to `<text>_<NNNN>` starting at _0000.",
             grid_args={"row": 0, "column": 1, "sticky": "nsew", "padx": (8, 0)},
             wraplength=360,
         )
@@ -5913,7 +5915,8 @@ class LoRATrainerGUI:
         ps_buttons = tk.Frame(ps_card, bg=COLORS["bg_surface"])
         ps_buttons.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
         ttk.Button(ps_buttons, text="Add Prefix", command=self.add_prefix_to_captions).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(ps_buttons, text="Add Suffix", command=self.add_suffix_to_captions).pack(side=tk.LEFT)
+        ttk.Button(ps_buttons, text="Add Suffix", command=self.add_suffix_to_captions).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(ps_buttons, text="Rename Files", command=self.rename_dataset_files).pack(side=tk.LEFT)
 
         # Card 5: Image Preview
         preview_card = self._start_section_card(
@@ -6126,6 +6129,11 @@ class LoRATrainerGUI:
         # before anything else and it can never be pushed off the edge.
         dialog.minsize(600, 360)
 
+        # Find/Replace row — packed at BOTTOM *before* btn_frame so it lands visually
+        # BELOW the action buttons (Tk gives the first BOTTOM-packed widget the lowest slot).
+        replace_frame = ttk.Frame(dialog)
+        replace_frame.pack(side=tk.BOTTOM, pady=(0, 10), fill=tk.X)
+
         btn_frame = ttk.Frame(dialog)
         btn_frame.pack(side=tk.BOTTOM, pady=10)
 
@@ -6174,6 +6182,51 @@ class LoRATrainerGUI:
         ttk.Button(btn_frame, text="Save", command=save_caption).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Regenerate (AI)", command=regenerate).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+
+        def replace_in_caption():
+            needle = find_entry.get()
+            if not needle:
+                return
+
+            def match_case(original, sub):
+                """Mirror original's case pattern onto sub: BOX→SPHERE, Box→Sphere, box→sphere.
+                Mixed-case falls back to char-by-char mapping for the letters we have."""
+                if original.isupper():
+                    return sub.upper()
+                if original.islower():
+                    return sub.lower()
+                if original[:1].isupper() and original[1:].islower():
+                    return sub[:1].upper() + sub[1:].lower()
+                out = list(sub)
+                for i, ch in enumerate(out):
+                    if i < len(original):
+                        out[i] = ch.upper() if original[i].isupper() else ch.lower()
+                return ''.join(out)
+
+            sub = replace_entry.get()
+            current = caption_text.get('1.0', tk.END).rstrip('\n')
+            updated = re.sub(
+                re.escape(needle),
+                lambda m: match_case(m.group(0), sub),
+                current,
+                flags=re.IGNORECASE,
+            )
+            caption_text.delete('1.0', tk.END)
+            caption_text.insert('1.0', updated)
+            try:
+                with open(caption_path, 'w', encoding='utf-8') as f:
+                    f.write(updated)
+                self.refresh_caption_images()
+            except Exception as e:
+                messagebox.showerror('Error', f'Failed to save caption: {e}')
+
+        ttk.Label(replace_frame, text='Find:').pack(side=tk.LEFT, padx=(5, 2))
+        find_entry = ttk.Entry(replace_frame)
+        find_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        ttk.Label(replace_frame, text='Replace:').pack(side=tk.LEFT, padx=(10, 2))
+        replace_entry = ttk.Entry(replace_frame)
+        replace_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        ttk.Button(replace_frame, text='Replace', command=replace_in_caption).pack(side=tk.LEFT, padx=5)
 
     # region Caption model selection (Florence-2 / Qwen3-VL)
 
@@ -7175,6 +7228,125 @@ class LoRATrainerGUI:
             f"{action} '{text}' to {changed} caption(s) ({created} new); skipped {skipped} (already had it)"
             + (f"; {errors} error(s)" if errors else "") + "\n")
         if changed:
+            self.refresh_caption_images()
+
+    def rename_dataset_files(self):
+        """Rename every image in the image folder (and its paired `.txt` caption) to
+        `<text>_<NNNN>` using the Prefix/Suffix Text field, zero-padded to 4 digits starting
+        at _0000. Two-phase rename via unique temp names keeps source and target namespaces
+        from colliding when a source already matches the target pattern; numbers already
+        taken by unmanaged files (anything in the folder that isn't an image or its paired
+        caption) are skipped so nothing is overwritten."""
+        folder = self.image_folder_var.get().strip() if hasattr(self, "image_folder_var") else ""
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Error", "Please select a valid folder")
+            return
+        text = self.prefix_suffix_text_var.get().strip()
+        if not text:
+            messagebox.showerror("Error", "Please enter text for the new file names")
+            return
+        # Reject characters that can't appear in Windows filenames — os.rename would happily
+        # create a file the OS then refuses to work with, leaving the dataset half-renamed.
+        invalid = set('<>:"/\\|?*')
+        bad = sorted(ch for ch in set(text) if ch in invalid)
+        if bad:
+            messagebox.showerror("Error", f"Text contains invalid filename characters: {' '.join(bad)}")
+            return
+
+        image_exts = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif"}
+        try:
+            entries = sorted(os.listdir(folder))
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read folder: {e}")
+            return
+        image_files = [
+            os.path.join(folder, name) for name in entries
+            if os.path.splitext(name)[1].lower() in image_exts
+            and os.path.isfile(os.path.join(folder, name))
+        ]
+        if not image_files:
+            messagebox.showerror("Error", "No image files found in the folder")
+            return
+
+        # Phase 1: stage each image (and its paired .txt if present) under a unique temp
+        # name. Clearing the source namespace first means a source named `box_0000.jpg`
+        # can't collide with the `box_0000.jpg` we want to create in Phase 2.
+        temp_prefix = f"~~fizgig_rename_{time.time_ns()}_"
+        staged = []  # list of (tmp_img, tmp_txt_or_None)
+        errors = 0
+        counter = 0
+        for img_file in image_files:
+            root, ext = os.path.splitext(img_file)
+            txt_file = root + ".txt"
+            tmp_txt = None
+            if os.path.isfile(txt_file):
+                tmp_txt = os.path.join(folder, f"{temp_prefix}{counter}.txt")
+                while os.path.exists(tmp_txt):
+                    counter += 1
+                    tmp_txt = os.path.join(folder, f"{temp_prefix}{counter}.txt")
+            tmp_img = os.path.join(folder, f"{temp_prefix}{counter}{ext}")
+            while os.path.exists(tmp_img):
+                counter += 1
+                tmp_img = os.path.join(folder, f"{temp_prefix}{counter}{ext}")
+            try:
+                os.rename(img_file, tmp_img)
+                if tmp_txt is not None:
+                    os.rename(txt_file, tmp_txt)
+            except Exception as e:
+                errors += 1
+                self.update_caption_log(f"Error staging {os.path.basename(img_file)}: {e}\n")
+                # Best-effort rollback so the original isn't orphaned under a temp name.
+                try:
+                    if os.path.exists(tmp_img) and not os.path.exists(img_file):
+                        os.rename(tmp_img, img_file)
+                except Exception:
+                    pass
+                continue
+            staged.append((tmp_img, tmp_txt))
+            counter += 1
+
+        # Numbers taken by files we don't manage (anything left in the folder matching the
+        # target pattern that isn't one of our temp names) must be skipped so we don't overwrite.
+        used = set()
+        pattern = re.compile(rf"^{re.escape(text)}_(\d{{4}})$")
+        for name in os.listdir(folder):
+            if name.startswith(temp_prefix):
+                continue
+            m = pattern.match(os.path.splitext(name)[0])
+            if m:
+                used.add(int(m.group(1)))
+
+        # Phase 2: rename temp -> final, assigning sequential numbers and skipping used ones.
+        renamed = 0
+        next_num = 0
+        for tmp_img, tmp_txt in staged:
+            while next_num in used:
+                next_num += 1
+            ext = os.path.splitext(tmp_img)[1]
+            final_img = os.path.join(folder, f"{text}_{next_num:04d}{ext}")
+            try:
+                os.rename(tmp_img, final_img)
+            except Exception as e:
+                errors += 1
+                self.update_caption_log(f"Error renaming to {os.path.basename(final_img)}: {e}\n")
+                next_num += 1
+                continue
+            if tmp_txt is not None:
+                final_txt = os.path.join(folder, f"{text}_{next_num:04d}.txt")
+                try:
+                    os.rename(tmp_txt, final_txt)
+                except Exception as e:
+                    errors += 1
+                    self.update_caption_log(f"Error renaming caption to {os.path.basename(final_txt)}: {e}\n")
+            used.add(next_num)
+            next_num += 1
+            renamed += 1
+
+        self.update_caption_log(
+            f"Renamed {renamed} image(s) (+ captions) to '{text}_NNNN'"
+            + (f"; {errors} error(s)" if errors else "") + "\n"
+        )
+        if renamed:
             self.refresh_caption_images()
 
     def preview_find_replace(self):

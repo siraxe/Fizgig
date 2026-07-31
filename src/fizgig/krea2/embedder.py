@@ -264,9 +264,10 @@ def load_qwen3_vl_conditioner(
     tokenizer from ``tokenizer_repo`` (Hub id or local dir)."""
     from fizgig.utils.hf_cache import from_pretrained_cache_first
     if tokenizer_repo is None:
-        tokenizer_repo = QWEN3_VL_8B_INSTRUCT_REPO_ID if is_8b else QWEN3_VL_4B_INSTRUCT_REPO_I
-        
-    qwen = _load_qwen3_vl_model(model_path, dtype=dtype, device=device, disable_mmap=disable_mmap)
+        tokenizer_repo = QWEN3_VL_8B_INSTRUCT_REPO_ID if is_8b else QWEN3_VL_4B_INSTRUCT_REPO_ID
+
+    qwen = _load_qwen3_vl_model(model_path, dtype=dtype, device=device,
+                                disable_mmap=disable_mmap, is_8b=is_8b)
     tokenizer = from_pretrained_cache_first(AutoTokenizer, tokenizer_repo, max_length=max_length)
     processor = from_pretrained_cache_first(Qwen2TokenizerFast, tokenizer_repo, max_length=max_length)
     conditioner = Qwen3VLConditioner(qwen, tokenizer, processor, max_length=max_length,
