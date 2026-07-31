@@ -7203,20 +7203,34 @@ class LoRATrainerGUI:
         self.sample_enabled_check.pack(anchor=tk.W, padx=20, pady=14)
 
 
-        # --- Sample settings container (the 4 cards live inside this) ---
+        # --- Sample settings container: two rows of side-by-side cards ---
+        # Row A: Prompt & Dimensions (left)  |  Generation Frequency (right)
+        # Row B: Advanced (left)             |  Viewer (right)
         self.sample_settings_frame = tk.Frame(grid_holder, bg=COLORS["bg_deep"])
         self.sample_settings_frame.grid(row=2, column=0, sticky=tk.EW)
 
+        samples_row_a = tk.Frame(self.sample_settings_frame, bg=COLORS["bg_deep"])
+        samples_row_a.pack(fill=tk.X, padx=36, pady=(0, 16))
+        samples_row_a.grid_columnconfigure(0, weight=1, uniform="samples")
+        samples_row_a.grid_columnconfigure(1, weight=1, uniform="samples")
+
+        samples_row_b = tk.Frame(self.sample_settings_frame, bg=COLORS["bg_deep"])
+        samples_row_b.pack(fill=tk.X, padx=36, pady=(0, 16))
+        samples_row_b.grid_columnconfigure(0, weight=1, uniform="samples")
+        samples_row_b.grid_columnconfigure(1, weight=1, uniform="samples")
+
         # Card 1: Prompt & Dimensions
         prompt_card = self._start_section_card(
-            self.sample_settings_frame, "Prompt & Dimensions",
+            samples_row_a, "Prompt & Dimensions",
             "Multi-line prompt, output size, steps and seed for each preview render.",
+            grid_args={"row": 0, "column": 0, "sticky": "nsew", "padx": (0, 8)},
+            wraplength=360,
         )
         prompt_card.grid_columnconfigure(1, weight=1)
 
         ttk.Label(prompt_card, text="Prompt:").grid(row=0, column=0, sticky=tk.NW, padx=(0, 10), pady=4)
         self.sample_prompt_text = tk.Text(
-            prompt_card, height=3, width=50, bg=COLORS["bg_surface"], fg=COLORS["text_primary"],
+            prompt_card, height=3, width=40, bg=COLORS["bg_surface"], fg=COLORS["text_primary"],
             insertbackground=COLORS["text_primary"], font=(FONT_FAMILY, 10), wrap="word",
             relief="flat", highlightthickness=1,
             highlightbackground=COLORS["border"], highlightcolor=COLORS["border_focus"],
@@ -7280,13 +7294,15 @@ class LoRATrainerGUI:
                       "it rather than generate from scratch). Auto-resized to ~0.20 MP so any size is safe. Leave "
                       "empty for normal samples.",
                  font=(FONT_FAMILY, 10), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
-                 wraplength=560, justify=tk.LEFT)
+                 wraplength=340, justify=tk.LEFT)
         self.sample_ref_note.grid(row=6, column=1, columnspan=2, sticky=tk.W, pady=(0, 4))
 
         # Card 2: Generation Frequency
         freq_card = self._start_section_card(
-            self.sample_settings_frame, "Generation Frequency",
+            samples_row_a, "Generation Frequency",
             "How often preview renders fire during training. Set either value to 0 to disable that cadence.",
+            grid_args={"row": 0, "column": 1, "sticky": "nsew", "padx": (8, 0)},
+            wraplength=360,
         )
         freq_card.grid_columnconfigure(1, weight=1)
 
@@ -7334,7 +7350,7 @@ class LoRATrainerGUI:
                       "comfortable; off = reload each time. Only applies when sampling isn't block-swapping the "
                       "Distilled — i.e. 24 GB+ cards, where the sample peaks around ~18 GB).",
                  font=(FONT_FAMILY, 8, "italic"), fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
-                 wraplength=600, justify=tk.LEFT)
+                 wraplength=340, justify=tk.LEFT)
         self.cache_sample_model_note.grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
 
         # Krea 2 preview engine — lives HERE with the other sample-model choices (the Distilled
@@ -7354,7 +7370,7 @@ class LoRATrainerGUI:
         tk.Label(self.krea2_engine_frame, text="Krea 2 preview engine:", font=(FONT_FAMILY, 10),
                  fg=COLORS["text_secondary"], bg=COLORS["bg_surface"]).pack(side=tk.LEFT, padx=(0, 8))
         _eng_combo = ttk.Combobox(self.krea2_engine_frame, textvariable=self.krea2_preview_engine_var,
-                                  state="readonly", width=52,
+                                  state="readonly", width=32,
                                   values=list(self._KREA2_ENGINE_LABELS.values()))
         _eng_combo.pack(side=tk.LEFT)
         _eng_combo.bind("<<ComboboxSelected>>", lambda e: self._save_last_used_paths())
@@ -7369,14 +7385,16 @@ class LoRATrainerGUI:
                  "switched on just for the render — nothing loaded or moved between epochs. The "
                  "classic mode loads the ~13 GB Turbo checkpoint per preview instead.",
             font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
-            wraplength=600, justify=tk.LEFT)
+            wraplength=340, justify=tk.LEFT)
         # Gridded (rows 6-7) / removed by _apply_samples_klein_only; hidden by default (Klein).
 
         # Card 3: Architecture-Specific (Flow Shift / Guidance / Negative / CFG)
         arch_card = self._start_section_card(
-            self.sample_settings_frame, "Advanced",
+            samples_row_b, "Advanced",
             "Architecture-specific knobs. Distilled models disable Negative Prompt; "
             "non-distilled models disable CFG Scale.",
+            grid_args={"row": 0, "column": 0, "sticky": "nsew", "padx": (0, 8)},
+            wraplength=360,
         )
         arch_card.grid_columnconfigure(1, weight=1)
 
@@ -7403,7 +7421,7 @@ class LoRATrainerGUI:
         self.sample_negative_var = tk.StringVar(value=self.settings["SAMPLE_NEGATIVE"])
         _neg_frame = tk.Frame(arch_card, bg=COLORS["bg_surface"])
         _neg_frame.grid(row=1, column=1, columnspan=2, sticky=tk.W, pady=4)
-        self.sample_negative_entry = ttk.Entry(_neg_frame, textvariable=self.sample_negative_var, width=50)
+        self.sample_negative_entry = ttk.Entry(_neg_frame, textvariable=self.sample_negative_var, width=30)
         self.sample_negative_entry.pack(side=tk.LEFT)
         _arch_note(_neg_frame, "Base samples only — Distilled ignores it").pack(side=tk.LEFT, padx=(10, 0))
         self.sample_negative_row = 1
@@ -7420,8 +7438,10 @@ class LoRATrainerGUI:
 
         # Card 4: Viewer
         viewer_card = self._start_section_card(
-            self.sample_settings_frame, "Viewer",
+            samples_row_b, "Viewer",
             "Browse generated samples without leaving the app, or open the folder in Explorer.",
+            grid_args={"row": 0, "column": 1, "sticky": "nsew", "padx": (8, 0)},
+            wraplength=360,
         )
 
         viewer_buttons = tk.Frame(viewer_card, bg=COLORS["bg_surface"])
