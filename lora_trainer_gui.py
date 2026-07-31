@@ -12667,11 +12667,6 @@ class LoRATrainerGUI:
                            "quantise at all",
         )
         kr = self._add_pref_row(
-            krea_card, kr, "Qwen3-VL TE 8B:", "krea2_text_encoder_8b",
-            "Qwen3-VL-8B text encoder. Optional alternative to the 4B above — larger VRAM footprint, "
-            "use only if you have a specific reason to prefer the 8B variant",
-        )
-        kr = self._add_pref_row(
             krea_card, kr, "Turbo LoRA (rank 64):", "krea2_turbo_lora",
             "Turbo distillation as a LoRA — RAW + this at strength 1.0 samples like the Turbo model "
             "(same 8-step CFG-free settings), letting previews run on the training DiT without loading "
@@ -12762,6 +12757,22 @@ class LoRATrainerGUI:
                                     "Default folder for reference images — Repair Studio and LoRA the Explorer", is_dir=True)
         in_row = self._add_pref_row(in_card, in_row, "Training images:", "input_dataset_dir",
                                     "Default folder the Start tab's Browse opens in", is_dir=True)
+
+        # Card: Extra Models — optional alternative files that don't belong on the
+        # main Krea 2 paths card. Packed above the RunPod card.
+        extra_card = self._start_section_card(
+            outer, "Extra Models",
+            "Optional alternative model files. Not needed for normal training — the paths on "
+            "the cards above are what Fizgig loads by default.",
+        )
+        extra_card.columnconfigure(1, weight=1)
+        er = 0
+        er = self._add_pref_row(
+            extra_card, er, "Qwen3-VL TE 8B:", "krea2_text_encoder_8b",
+            "Qwen3-VL-8B text encoder — an optional alternative to the 4B encoder on the "
+            "Krea 2 card. Larger VRAM footprint; use only if you have a specific reason "
+            "to prefer the 8B variant",
+        )
 
         self._add_runpod_card(outer)
 
