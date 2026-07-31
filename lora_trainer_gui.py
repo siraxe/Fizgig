@@ -5597,14 +5597,24 @@ class LoRATrainerGUI:
             "You can optionally skip this tab if your images already have .txt caption files.",
         )
 
-        # Card 1: Captioning Settings
+        # Cards 1, 2, 3 in a 2-column grid: Captioning Settings on the left
+        # (spans both rows so it stays the tall one), Generate Captions top-right,
+        # Bilingual Translation bottom-right.
+        cap_layout = tk.Frame(outer, bg=COLORS["bg_deep"])
+        cap_layout.pack(fill=tk.X, padx=36, pady=(0, 16))
+        cap_layout.grid_columnconfigure(0, weight=1, uniform="cap")
+        cap_layout.grid_columnconfigure(1, weight=1, uniform="cap")
+
+        # Card 1: Captioning Settings (left column, spans both rows)
         settings_card = self._start_section_card(
-            outer, "Captioning Settings",
+            cap_layout, "Captioning Settings",
             "Trigger word is prepended to every caption. Qwen3-VL follows a captioning instruction "
             "you can read and edit, and is the better fit for training data — it needs the Krea 2 "
             "text encoder set in Preferences, and captions any dataset, Klein included. Florence-2 "
             "is smaller and downloads itself on first use. Static Caption writes the trigger word "
             "only.",
+            grid_args={"row": 0, "column": 0, "rowspan": 2, "sticky": "nsew", "padx": (0, 8)},
+            wraplength=360,
         )
         settings_card.grid_columnconfigure(1, weight=1)
 
@@ -5685,29 +5695,37 @@ class LoRATrainerGUI:
             settings_card, text="Overwrite existing caption files", variable=self.overwrite_captions_var,
         ).grid(row=6, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
 
-        # Card 2: Generate Captions
-        actions_card = self._start_section_card(outer, "Generate Captions", None)
-        action_row = tk.Frame(actions_card, bg=COLORS["bg_surface"])
-        action_row.pack(anchor=tk.W)
+        # Card 2: Generate Captions (top-right) — 4 buttons in a 2x2 grid.
+        actions_card = self._start_section_card(
+            cap_layout, "Generate Captions", None,
+            grid_args={"row": 0, "column": 1, "sticky": "nsew", "padx": (8, 0), "pady": (0, 16)},
+        )
+        action_grid = tk.Frame(actions_card, bg=COLORS["bg_surface"])
+        action_grid.pack(anchor=tk.W, fill=tk.X)
+        action_grid.grid_columnconfigure(0, weight=1)
+        action_grid.grid_columnconfigure(1, weight=1)
         # Kept on self so a running job can grey them out — clicking Caption All twice used to
         # start a SECOND worker over the same files, which reads as the job having been queued.
-        self.caption_all_btn = ttk.Button(action_row, text="Caption All Images (AI)",
+        self.caption_all_btn = ttk.Button(action_grid, text="Caption All Images (AI)",
                                           command=self.caption_all_florence)
-        self.caption_all_btn.pack(side=tk.LEFT, padx=(0, 8))
-        self.caption_static_btn = ttk.Button(action_row, text="Static Caption All",
+        self.caption_all_btn.grid(row=0, column=0, sticky=tk.EW, padx=(0, 6), pady=(0, 6))
+        self.caption_static_btn = ttk.Button(action_grid, text="Static Caption All",
                                              command=self.generate_captions)
-        self.caption_static_btn.pack(side=tk.LEFT, padx=(0, 8))
-        self.caption_stop_btn = ttk.Button(action_row, text="Stop", command=self.stop_captioning, state=tk.DISABLED)
-        self.caption_stop_btn.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(action_row, text="Unload Model", command=self.unload_florence_model).pack(side=tk.LEFT)
+        self.caption_static_btn.grid(row=0, column=1, sticky=tk.EW, padx=(6, 0), pady=(0, 6))
+        self.caption_stop_btn = ttk.Button(action_grid, text="Stop", command=self.stop_captioning, state=tk.DISABLED)
+        self.caption_stop_btn.grid(row=1, column=0, sticky=tk.EW, padx=(0, 6))
+        ttk.Button(action_grid, text="Unload Model", command=self.unload_florence_model).grid(
+            row=1, column=1, sticky=tk.EW, padx=(6, 0))
 
-        # Card 3: Bilingual translation
+        # Card 3: Bilingual translation (bottom-right, under Generate Captions)
         bilingual_card = self._start_section_card(
-            outer, "Bilingual Translation (English + Chinese)",
+            cap_layout, "Bilingual Translation (English + Chinese)",
             "Translates each English caption to Chinese via Helsinki-NLP/opus-mt-en-zh (~300MB, auto-downloaded "
             "on first use) and appends as `english - chinese`. Trigger word preserved if it's the first "
             "comma-separated token. Hypothesis: dual-language signal may improve LoRA convergence — "
             "empirical test needed.",
+            grid_args={"row": 1, "column": 1, "sticky": "nsew", "padx": (8, 0)},
+            wraplength=360,
         )
         bilingual_row = tk.Frame(bilingual_card, bg=COLORS["bg_surface"])
         bilingual_row.pack(anchor=tk.W)
