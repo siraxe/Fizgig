@@ -260,15 +260,15 @@ def load_qwen3_vl_conditioner(
     disable_mmap: bool = True,
     is_8b: bool = False,
 ) -> "Qwen3VLConditioner":
-    """Load the Qwen3-VL conditioner used by K2: weights from ``model_path`` (safetensors),
-    tokenizer from ``tokenizer_repo`` (Hub id or local dir). ``is_8b`` switches the vendored
-    config (and the default tokenizer repo) to the 8B variant."""
+    """Load the Qwen3-VL-4B conditioner used by K2: weights from ``model_path`` (safetensors),
+    tokenizer from ``tokenizer_repo`` (Hub id or local dir)."""
+    from fizgig.utils.hf_cache import from_pretrained_cache_first
     if tokenizer_repo is None:
-        tokenizer_repo = QWEN3_VL_8B_INSTRUCT_REPO_ID if is_8b else QWEN3_VL_4B_INSTRUCT_REPO_ID
-    qwen = _load_qwen3_vl_model(model_path, dtype=dtype, device=device, disable_mmap=disable_mmap,
-                                is_8b=is_8b)
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo, max_length=max_length)
-    processor = Qwen2TokenizerFast.from_pretrained(tokenizer_repo, max_length=max_length)
+        tokenizer_repo = QWEN3_VL_8B_INSTRUCT_REPO_ID if is_8b else QWEN3_VL_4B_INSTRUCT_REPO_I
+        
+    qwen = _load_qwen3_vl_model(model_path, dtype=dtype, device=device, disable_mmap=disable_mmap)
+    tokenizer = from_pretrained_cache_first(AutoTokenizer, tokenizer_repo, max_length=max_length)
+    processor = from_pretrained_cache_first(Qwen2TokenizerFast, tokenizer_repo, max_length=max_length)
     conditioner = Qwen3VLConditioner(qwen, tokenizer, processor, max_length=max_length,
                                      select_layers=select_layers, tokenizer_repo=tokenizer_repo)
     return conditioner.eval().requires_grad_(False)
@@ -301,46 +301,6 @@ SUBJECT_RULE = (
 NO_PREAMBLE_RULE = (
     "Begin directly with the subject. Never open with 'This image shows', 'The image depicts', "
     "'In this image', 'Here we see', 'The photo shows' or any similar preamble. "
-)
-
-# --- style-caption rules -------------------------------------------------------------------
-# The rules above are written for identity training, where the subject is a person and the
-# lighting, viewpoint and clothing all VARY — you name them so they stay steerable. A style
-# dataset inverts that: the look is the constant you are training, and the subject is whatever
-# happens to be in front of it.
-#
-# Hence one rule underneath both style presets: caption what varies, never the constant.
-#
-# DEPICTED_RULE replaces SUBJECT_RULE, which can only say 'a woman' / 'a man' / 'a girl' /
-# 'a boy'. A style set is landscapes, objects, animals and abstracts as often as people, and the
-# 4B model hedges to "a scene" for those exactly as it hedged to "a person" for faces.
-#
-# NO_STYLE_RULE lists lighting deliberately, and it is the one that looks wrong next to the four
-# presets above — all of which ASK for lighting. Both are right: there it varies, here it is part
-# of the look, and a style captioned with its lighting only fires under the lighting it saw. The
-# same goes for medium and colour grade: describing the constant in different words image by image
-# splits it across many tokens instead of concentrating it where it belongs.
-DEPICTED_RULE = (
-    "Name what is depicted with the specific term a viewer would use — 'a woman', 'a man', "
-    "'a cat', 'a mountain range', 'a teapot', 'an empty street' — never the vague 'a person', "
-    "'an animal' or 'a scene'. If nothing concrete is depicted, name the shapes and forms "
-    "instead. "
-)
-# The "as if it were real" framing is doing the heavy lifting, and it was earned the hard way. An
-# earlier version listed only art-TECHNIQUE words (brushwork, shading, rendering) and a layered
-# paper-cut dataset walked straight past it: the model never reached for a technique word, it
-# described the style in CONTENT-shaped ones — "layered mountains", "arranged in layered depth",
-# "tiered pagodas" — in 4 of 9 captions. Extending the blocklist is whack-a-mole; every style has
-# its own vocabulary. Telling it to describe the real scene removes the whole class at once,
-# because a real place has no layers, no brushstrokes and no composition. Measured on that dataset:
-# 4/9 -> 0/9, with the closing style phrase still landing 9/9.
-NO_STYLE_RULE = (
-    "Describe the scene as if it were real and you were standing in it, not as a picture someone "
-    "made — if a word would only make sense about an artwork, leave it out. Name only WHAT is "
-    "there, never how it was made: say nothing about medium, brushwork, linework, texture, "
-    "shading, rendering, layers, stacking, relief, depth arrangement, film stock, grain, colour "
-    "grading, palette, lighting, mood, atmosphere, era or quality. Name the colours of the things "
-    "themselves, but not the overall colour treatment. "
 )
 
 CAPTION_INSTRUCTION = (
@@ -390,43 +350,33 @@ DETAILED_DESCRIPTION_INSTRUCTION = (
     "State only what is visible — no speculation, no names, no style commentary."
 )
 
-# Two style presets rather than one, because the trigger-word field already prepends
-# f"{trigger}, " to every caption (save_caption_with_trigger in the GUI) and can only ever produce
-# that weak comma form. Naming the look properly has to come from the instruction instead:
-#   content only + trigger 'mystyle' -> "mystyle, a vintage blue car parked on a street"
-#   in-X-style, no trigger           -> "a vintage blue car parked on a street, in mystyle style"
-# The labels say which is which, so the choice happens at the point of selection.
+# --- style captioning ------------------------------------------------------------------------
+# The identity instructions above are written for a dataset where the subject is a person and the
+# lighting, viewpoint and clothing all VARY — you name them so they stay steerable. A style dataset
+# inverts that: the look is the constant you are training, and the subject is whatever happens to
+# be in front of it. So the caption takes the content and leaves the style unnamed, which is what
+# lets the LoRA bind the look to the trigger word the GUI prepends.
+#
+# This instruction is deliberately SHORT, and that is the finding, not an oversight. Earlier
+# versions of this preset stacked four rule fragments — name the subject specifically, no preamble,
+# describe it as if it were a real place, never mention medium/technique/grade — and by the obvious
+# metric they won easily: on a layered paper-cut set they leaked style words into 1 caption in 9,
+# where this one-liner leaks into 7. But the one-liner is what trains better, tested on real runs
+# across both Krea 2 and Klein, and it is not close.
+#
+# The likely reason is worth keeping, because it cuts against the instinct to keep adding rules:
+#   - Leaking CONSISTENTLY is not the same failure as leaking half the time. A word in 7 captions
+#     of 9 behaves like a style tag; a word in 4 of 9 teaches the model that some of these images
+#     have a property the others lack. The rule stack was tuned against the wrong number.
+#   - The short instruction produces captions roughly 2.4x richer (~70 words vs ~30). More content
+#     named means more of the image accounted for, which leaves the style as the cleaner residual.
+#     The rules were buying leak-purity with detail, and detail is what the LoRA works from.
+#
+# Token budget is 160 rather than the ~90 the length implies: at 90 every caption on the test set
+# was cut off mid-word.
 STYLE_CAPTION_INSTRUCTION = (
-    "Write one factual training caption for this image as a single sentence of 30-50 words, "
-    "covering these in order: what is depicted and what it is doing; how it is arranged in the "
-    "frame; the setting or background. Use the same order and the same plain phrasing every "
-    "time. " + DEPICTED_RULE + NO_PREAMBLE_RULE + NO_STYLE_RULE +
-    "State only what is visible — no speculation and no proper names."
-)
-
-# The style phrase goes at the END, in the "in X style" construction, because that is what gives
-# a made-up token a job. 'mystyle' on its own is a noise word the model can only decode from
-# repetition; '… in mystyle style' drops it into a slot the language model already understands,
-# next to the word that defines what it is. The same construction works for a real phrase
-# ('in oil painting style'), so one preset covers both the token and the descriptive case.
-#
-# This sits next to the opposite-looking rule in the trainer, which APPENDS the identity trigger
-# precisely because "a trailing token is a far weaker identity claim than a leading one". They do
-# not contradict: there the subject may be absent from a given shot and a weak claim is the point,
-# whereas the style is in every image here, and it is the 'in … style' scaffold doing the binding
-# rather than the position.
-#
-# Edit the phrase to match the dataset. Unlike a leading phrase there is nothing to get wrong:
-# _strip_caption_preamble only matches at the start of a caption, so any trailing wording is safe,
-# and an unedited run still trains — it just binds the look to the literal token 'mystyle'.
-STYLE_NAMED_CAPTION_INSTRUCTION = (
-    "Write one factual training caption for this image as a single sentence of 30-50 words, "
-    "covering these in order: what is depicted and what it is doing; how it is arranged in the "
-    "frame; the setting or background. Then end the sentence with the exact words 'in mystyle "
-    "style'. Use that same closing phrase word for word every time, and the same plain phrasing "
-    "throughout. " + DEPICTED_RULE + NO_PREAMBLE_RULE + NO_STYLE_RULE +
-    "Those closing words are the only place the style is named. State only what is visible — no "
-    "speculation and no proper names."
+    "Describe the image with zero references to the image style, just the factual contents of "
+    "what is depicted."
 )
 
 # The task menu the Captions tab offers for this model. Lives here rather than in the GUI so the
@@ -441,10 +391,10 @@ CAPTION_TASKS = {
     "short":      ("Short caption", SHORT_CAPTION_INSTRUCTION, 60),
     "detailed":   ("Detailed description", DETAILED_DESCRIPTION_INSTRUCTION, 160),
     "exhaustive": ("Exhaustive detail", DETAILED_CAPTION_INSTRUCTION, 240),
-    # Style presets last: the four above are the identity path, which is the common case and the
-    # one auto-recaption uses. 80/90 tokens ≈ the 30-50 word target with headroom.
-    "style":       ("Style — content only (with trigger word)", STYLE_CAPTION_INSTRUCTION, 80),
-    "style_named": ("Style — in X style (edit the phrase)", STYLE_NAMED_CAPTION_INSTRUCTION, 90),
+    # Style last: the four above are the identity path, which is the common case and the one
+    # auto-recaption uses.
+    "style":      ("Style — contents only (trigger word names the style)",
+                   STYLE_CAPTION_INSTRUCTION, 160),
 }
 DEFAULT_CAPTION_TASK = "training"
 
@@ -605,8 +555,9 @@ class Qwen3VLConditioner(torch.nn.Module):
         so text-only training never pays for it."""
         if self._image_processor is None:
             from transformers import AutoProcessor
+            from fizgig.utils.hf_cache import from_pretrained_cache_first
             repo = self.tokenizer_repo or QWEN3_VL_4B_INSTRUCT_REPO_ID
-            self._image_processor = AutoProcessor.from_pretrained(repo)
+            self._image_processor = from_pretrained_cache_first(AutoProcessor, repo)
         return self._image_processor
 
     @staticmethod

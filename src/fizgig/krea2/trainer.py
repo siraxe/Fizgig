@@ -1268,7 +1268,19 @@ def train_krea2(
     if str(compile_blocks).lower() == "auto":
         from fizgig.utils.capabilities import should_compile
         _steps_est = group.num_train_items * max_train_epochs
-        _do_compile, _why = should_compile(_steps_est, quant_4bit, quant_int8, blocks_to_swap)
+        # The largest ACTUAL bucket, not the Target Megapixels box — bucket_no_upscale can land
+        # buckets well below the target, and it's the real token count that sets compiled-path
+        # VRAM. Batch rides along because it multiplies tokens per step the same way. Unreadable
+        # values fall back to the defaults, i.e. the pre-shape-aware behaviour.
+        _mp_max, _batch_max = 0.25, 1
+        try:
+            _mp_max = max(w * h / 1e6 for ds in group.datasets
+                          for (w, h) in ds.batch_manager.bucket_resos)
+            _batch_max = max(int(ds.batch_size) for ds in group.datasets)
+        except Exception:
+            pass
+        _do_compile, _why = should_compile(_steps_est, quant_4bit, quant_int8, blocks_to_swap,
+                                           mp=_mp_max, batch=_batch_max)
         logger.info("[compile] auto: %s — %s", "ENABLED" if _do_compile else "off", _why)
 
     # Preview setup: pre-encode prompts (frees the 8GB encoder) + load the VAE BEFORE the RAW DiT,
@@ -1651,6 +1663,13 @@ def train_krea2(
                 from fizgig.modules.nf4 import move_nf4_to_device
                 move_nf4_to_device(dit, device)
             dit.train()
+
+    # Return the load-time transients (quantise staging, resume's optimizer-state copy) to the
+    # driver before stepping. Fresh runs with Sample at Start got this for free from the
+    # preview's empty_cache; resumed runs skip that preview and sat ~4 GB high until the first
+    # epoch-boundary preview cleared it (issue #24). Unconditional so every path starts clean.
+    gc.collect()
+    torch.cuda.empty_cache()
 
     progress_bar = tqdm(total=steps_per_epoch * max_train_epochs, initial=global_step,
                         desc="steps", smoothing=0)
