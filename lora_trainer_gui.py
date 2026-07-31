@@ -5706,11 +5706,22 @@ class LoRATrainerGUI:
         action_grid.grid_columnconfigure(1, weight=1)
         # Kept on self so a running job can grey them out — clicking Caption All twice used to
         # start a SECOND worker over the same files, which reads as the job having been queued.
-        self.caption_all_btn = ttk.Button(action_grid, text="Caption All Images (AI)",
-                                          command=self.caption_all_florence)
+        # Coloured green (tk.Button, not ttk) to mark them as the two primary actions — the
+        # Stop / Unload buttons below stay default-themed, so the eye lands here first.
+        _primary_btn_kwargs = dict(
+            bg=COLORS["success"], fg="#FFFFFF",
+            activebackground="#0E9F70", activeforeground="#FFFFFF",
+            disabledforeground="#A7F3D0",
+            relief="flat", bd=0, cursor="hand2", padx=10, pady=4,
+            font=(FONT_FAMILY, 10),
+        )
+        self.caption_all_btn = tk.Button(
+            action_grid, text="Caption All Images (AI)",
+            command=self.caption_all_florence, **_primary_btn_kwargs)
         self.caption_all_btn.grid(row=0, column=0, sticky=tk.EW, padx=(0, 6), pady=(0, 6))
-        self.caption_static_btn = ttk.Button(action_grid, text="Static Caption All",
-                                             command=self.generate_captions)
+        self.caption_static_btn = tk.Button(
+            action_grid, text="Static Caption All",
+            command=self.generate_captions, **_primary_btn_kwargs)
         self.caption_static_btn.grid(row=0, column=1, sticky=tk.EW, padx=(6, 0), pady=(0, 6))
         self.caption_stop_btn = ttk.Button(action_grid, text="Stop", command=self.stop_captioning, state=tk.DISABLED)
         self.caption_stop_btn.grid(row=1, column=0, sticky=tk.EW, padx=(0, 6))
