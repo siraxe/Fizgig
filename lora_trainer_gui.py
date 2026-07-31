@@ -2091,6 +2091,17 @@ class LoRATrainerGUI:
             foreground=[("active", COLORS["text_primary"])]
         )
 
+        # Green-accent surface checkbutton (e.g. the Samples "Enable" toggle)
+        style.configure("Success.TCheckbutton",
+            background=COLORS["bg_surface"],
+            foreground=COLORS["success"],
+            font=(FONT_FAMILY, 10)
+        )
+        style.map("Success.TCheckbutton",
+            background=[("active", COLORS["bg_surface"])],
+            foreground=[("active", COLORS["success"])]
+        )
+
         # Notebook (tabs)
         style.configure("TNotebook",
             background=COLORS["bg_deep"],
@@ -7195,10 +7206,11 @@ class LoRATrainerGUI:
         enable_card = tk.Frame(enable_card_outer, bg=COLORS["bg_surface"],
                                highlightbackground=COLORS["border"], highlightthickness=1, bd=0)
         enable_card.pack(fill=tk.X)
-        # Use ttk.Checkbutton — themed; sits on bg_surface via style inheritance
+        # Use ttk.Checkbutton — themed; sits on bg_surface via style inheritance.
+        # Styled green so the toggle reads as the "go" knob for this tab.
         self.sample_enabled_check = ttk.Checkbutton(
             enable_card, text="Enable Sample Generation", variable=self.sample_enabled_var,
-            command=self.toggle_sample_settings,
+            command=self.toggle_sample_settings, style="Success.TCheckbutton",
         )
         self.sample_enabled_check.pack(anchor=tk.W, padx=20, pady=14)
 
@@ -7230,7 +7242,7 @@ class LoRATrainerGUI:
 
         ttk.Label(prompt_card, text="Prompt:").grid(row=0, column=0, sticky=tk.NW, padx=(0, 10), pady=4)
         self.sample_prompt_text = tk.Text(
-            prompt_card, height=3, width=40, bg=COLORS["bg_surface"], fg=COLORS["text_primary"],
+            prompt_card, height=4, width=40, bg=COLORS["bg_surface"], fg=COLORS["text_primary"],
             insertbackground=COLORS["text_primary"], font=(FONT_FAMILY, 10), wrap="word",
             relief="flat", highlightthickness=1,
             highlightbackground=COLORS["border"], highlightcolor=COLORS["border_focus"],
