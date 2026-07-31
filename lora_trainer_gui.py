@@ -2378,12 +2378,18 @@ class LoRATrainerGUI:
         except Exception:
             pass
 
-    def _start_section_card(self, parent, title, description=None, accent_border=False):
+    def _start_section_card(self, parent, title, description=None, accent_border=False,
+                            grid_args=None, wraplength=760):
         """Start-tab-style surface card with an optional description line.
         Returns the inner content frame (caller packs/grids its widgets into it).
-        The card is packed into `parent` with horizontal padding matching the banner."""
+        The card is packed into `parent` with horizontal padding matching the banner,
+        unless grid_args is given — then it is placed with outer.grid(**grid_args),
+        which is how two cards end up side-by-side in a horizontal wrapper."""
         outer = tk.Frame(parent, bg=COLORS["bg_deep"])
-        outer.pack(fill=tk.X, padx=36, pady=(0, 16))
+        if grid_args is not None:
+            outer.grid(**grid_args)
+        else:
+            outer.pack(fill=tk.X, padx=36, pady=(0, 16))
 
         card = tk.Frame(outer, bg=COLORS["bg_surface"],
                         highlightbackground=COLORS["accent"] if accent_border else COLORS["border"],
@@ -2400,7 +2406,7 @@ class LoRATrainerGUI:
             tk.Label(card, text=description,
                      font=(FONT_FAMILY, 10),
                      fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
-                     wraplength=760, justify=tk.LEFT).pack(
+                     wraplength=wraplength, justify=tk.LEFT).pack(
                 anchor=tk.W, padx=20, pady=(0, 10)
             )
 
@@ -5714,13 +5720,20 @@ class LoRATrainerGUI:
             command=self._translate_captions_in_folder,
         ).pack(side=tk.LEFT)
 
+        # Cards 4 & 4b sit side-by-side: Find & Replace on the left, Add Prefix / Suffix on the right.
+        fr_ps_row = tk.Frame(outer, bg=COLORS["bg_deep"])
+        fr_ps_row.pack(fill=tk.X, padx=36, pady=(0, 16))
+        fr_ps_row.grid_columnconfigure(0, weight=1, uniform="frps")
+        fr_ps_row.grid_columnconfigure(1, weight=1, uniform="frps")
+
         # Card 4: Find & Replace
         fr_card = self._start_section_card(
-            outer, "Find & Replace",
+            fr_ps_row, "Find & Replace",
             "Bulk-edit every `.txt` caption file in the image folder. Preview first to see which files change.",
+            grid_args={"row": 0, "column": 0, "sticky": "nsew", "padx": (0, 8)},
+            wraplength=360,
         )
         fr_card.grid_columnconfigure(1, weight=1)
-        fr_card.grid_columnconfigure(3, weight=1)
 
         ttk.Label(fr_card, text="Find:").grid(row=0, column=0, sticky=tk.W, padx=(0, 10), pady=4)
         self.find_text_var = tk.StringVar()
@@ -5730,20 +5743,30 @@ class LoRATrainerGUI:
         self.replace_text_var = tk.StringVar()
         ttk.Entry(fr_card, textvariable=self.replace_text_var, width=40).grid(row=1, column=1, sticky=tk.EW, pady=4)
 
-        # Right column: Prefix/Suffix — prepends/appends the Text to every caption,
-        # skipping ones that already start/end with it. Pads with a single space.
-        ttk.Label(fr_card, text="Text:").grid(row=0, column=2, sticky=tk.W, padx=(20, 10), pady=4)
-        self.prefix_suffix_text_var = tk.StringVar()
-        ttk.Entry(fr_card, textvariable=self.prefix_suffix_text_var, width=40).grid(row=0, column=3, sticky=tk.EW, pady=4)
-        ps_btns = tk.Frame(fr_card, bg=COLORS["bg_surface"])
-        ps_btns.grid(row=1, column=2, columnspan=2, sticky=tk.W, pady=4)
-        ttk.Button(ps_btns, text="Prefix", command=self.add_prefix_to_captions).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(ps_btns, text="Suffix", command=self.add_suffix_to_captions).pack(side=tk.LEFT)
-
         fr_buttons = tk.Frame(fr_card, bg=COLORS["bg_surface"])
-        fr_buttons.grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(8, 0))
+        fr_buttons.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
         ttk.Button(fr_buttons, text="Replace in All .txt Files", command=self.find_replace_in_captions).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(fr_buttons, text="Preview Changes", command=self.preview_find_replace).pack(side=tk.LEFT)
+
+        # Card 4b: Add Prefix / Suffix — prepends/appends the Text to every caption,
+        # skipping ones that already start/end with it. Pads with a single space.
+        ps_card = self._start_section_card(
+            fr_ps_row, "Add Prefix / Suffix",
+            "Prepend or append the same text to every `.txt` caption in the image folder. "
+            "Skips captions that already start (or end) with it.",
+            grid_args={"row": 0, "column": 1, "sticky": "nsew", "padx": (8, 0)},
+            wraplength=360,
+        )
+        ps_card.grid_columnconfigure(1, weight=1)
+
+        ttk.Label(ps_card, text="Text:").grid(row=0, column=0, sticky=tk.W, padx=(0, 10), pady=4)
+        self.prefix_suffix_text_var = tk.StringVar()
+        ttk.Entry(ps_card, textvariable=self.prefix_suffix_text_var, width=40).grid(row=0, column=1, sticky=tk.EW, pady=4)
+
+        ps_buttons = tk.Frame(ps_card, bg=COLORS["bg_surface"])
+        ps_buttons.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+        ttk.Button(ps_buttons, text="Add Prefix", command=self.add_prefix_to_captions).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(ps_buttons, text="Add Suffix", command=self.add_suffix_to_captions).pack(side=tk.LEFT)
 
         # Card 5: Image Preview
         preview_card = self._start_section_card(
