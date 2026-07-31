@@ -446,7 +446,8 @@ BUILT_IN_PRESETS = {
 # those land in the per-architecture preset folder and appear alongside this one.
 KREA2_BUILT_IN_PRESETS = {
     "✨ Krea 2 Defaults (rank 32, full model)": {
-        "NETWORK_DIM": 32, "NETWORK_ALPHA": 32, "LEARNING_RATE": 1e-4,
+        "NETWORK_DIM": 32, "NETWORK_ALPHA": 32, "NETWORK_TYPE": "LoRA (standard)",
+        "LEARNING_RATE": 1e-4,
         "MAX_TRAIN_EPOCHS": 30, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
         "ADAPTIVE_LR": False, "ADAPTIVE_LR_MIN": "1e-4", "ADAPTIVE_LR_MAX": "4e-4",
         "TARGET_LAYERS": "Full Model", "MIN_TIMESTEP": "", "MAX_TIMESTEP": "",
@@ -467,7 +468,8 @@ KREA2_BUILT_IN_PRESETS = {
     # Rank 8 + Adaptive LR at an aggressive floor: fewer epochs to a usable LoRA. Everything
     # else identical to Krea 2 Defaults (which stays the preset applied on family switch).
     "✨ Krea 2 Ultra Fast (rank 8, adaptive LR)": {
-        "NETWORK_DIM": 8, "NETWORK_ALPHA": 8, "LEARNING_RATE": 1e-4,
+        "NETWORK_DIM": 8, "NETWORK_ALPHA": 8, "NETWORK_TYPE": "LoRA (standard)",
+        "LEARNING_RATE": 1e-4,
         "MAX_TRAIN_EPOCHS": 20, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
         "ADAPTIVE_LR": True, "ADAPTIVE_LR_MIN": "2e-4", "ADAPTIVE_LR_MAX": "4e-4",
         "TARGET_LAYERS": "Full Model", "MIN_TIMESTEP": "", "MAX_TIMESTEP": "",
@@ -497,7 +499,8 @@ KREA2_BUILT_IN_PRESETS = {
     # generations dragging toward the training set's COMPOSITIONS, not just its look —
     # so save every epoch and scrub for the sweet spot in LoRA Royale.
     "✨ Krea 2 Style (rank 16, gentle LR)": {
-        "NETWORK_DIM": 16, "NETWORK_ALPHA": 16, "LEARNING_RATE": 1e-4,
+        "NETWORK_DIM": 16, "NETWORK_ALPHA": 16, "NETWORK_TYPE": "LoRA (standard)",
+        "LEARNING_RATE": 1e-4,
         "MAX_TRAIN_EPOCHS": 15, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
         "ADAPTIVE_LR": True, "ADAPTIVE_LR_MIN": "5e-5", "ADAPTIVE_LR_MAX": "2e-4",
         "TARGET_LAYERS": "Full Model", "MIN_TIMESTEP": "", "MAX_TIMESTEP": "",
@@ -1036,6 +1039,10 @@ class LoRATrainerGUI:
             "LORA_LR_RATIO": 1,
             "NETWORK_DIM": 4,
             "NETWORK_ALPHA": 4,
+            # Krea 2 only (Klein hides it and trains standard). LoRA default; LoKR is the
+            # quality pick (validated 31 Jul: highest likeness measured here, no skin sheen).
+            "NETWORK_TYPE": "LoRA (standard)",
+            "LOKR_FACTOR": 8,
             "MAX_TRAIN_EPOCHS": 12,
             "SAVE_EVERY_N_EPOCHS": 1,
             "SEED": 42,
@@ -1271,7 +1278,17 @@ class LoRATrainerGUI:
     # ── Global log + status indicator ───────────────────────────────────
 
     def _append_global_log(self, text):
-        """Append text to the global log buffer and push to popup if open."""
+        """Append text to the global log buffer and push to popup if open.
+
+        Thread-safe by marshalling: several workers (profiler, extract, engine loads) log
+        from their own threads, and writing the console popup's Text widget off the main
+        thread is a Tcl panic — a hard process crash no try/except can catch. That is how
+        clicking the IDLE/BUSY light during a model load killed the app: the click queued,
+        the popup opened as the load returned, and the next worker log write hit it."""
+        import threading
+        if threading.current_thread() is not threading.main_thread():
+            self.master.after(0, self._append_global_log, text)
+            return
         self._log_buffer.append(text)
         if len(self._log_buffer) > 50000:
             self._log_buffer = self._log_buffer[-40000:]
@@ -2876,6 +2893,54 @@ class LoRATrainerGUI:
         self._add_field_to_section(training_content, "SAVE_EVERY_N_EPOCHS", "Save Every N Epochs", "int", 8)
         self._add_field_to_section(training_content, "SEED", "Seed", "int", 9)
 
+        # Network Type (Krea 2 only): standard LoRA or LoKR (Kronecker). Rows 18/19 sit between
+        # the Target Megapixels hint (17) and the Krea 2 loss-watch block (20). LoKR replaces
+        # rank/alpha with a single Factor dial, so the rows swap with the selection.
+        _nt_label = tk.Label(training_content, text="Network Type:", font=(FONT_FAMILY, 10),
+                             fg=COLORS["text_secondary"], bg=COLORS["bg_surface"])
+        _nt_label.grid(row=18, column=0, sticky=tk.W, padx=(12, 8), pady=4)
+        self.labels["NETWORK_TYPE"] = _nt_label
+        # Widget + hint share a row frame so the hint hugs the control instead of being
+        # pushed to the far column edge by the full-width rows above.
+        self._network_type_rowf = tk.Frame(training_content, bg=COLORS["bg_surface"])
+        self._network_type_rowf.grid(row=18, column=1, columnspan=2, sticky=tk.W, padx=5, pady=4)
+        self.entries["NETWORK_TYPE"] = ttk.Combobox(
+            self._network_type_rowf, values=["LoRA (standard)", "LoKR (Kronecker)"],
+            state="readonly", width=18)
+        self.entries["NETWORK_TYPE"].set(self.settings.get("NETWORK_TYPE", "LoRA (standard)"))
+        self.entries["NETWORK_TYPE"].pack(side=tk.LEFT)
+        self.entries["NETWORK_TYPE"].bind("<<ComboboxSelected>>",
+                                          lambda e: self._on_network_type_changed())
+        self._network_type_hint = tk.Label(
+            self._network_type_rowf,
+            text="LoKR: higher quality · LoRA: ~20% faster training",
+            font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+            justify=tk.LEFT)
+        self._network_type_hint.pack(side=tk.LEFT, padx=(10, 0))
+        # rows entry is the FRAME (the gridded thing show_row/hide_row must toggle).
+        self.rows["NETWORK_TYPE"] = {"row": 18, "label": _nt_label,
+                                     "entry": self._network_type_rowf,
+                                     "browse": None, "parent": training_content}
+
+        _lf_label = tk.Label(training_content, text="LoKR Factor:", font=(FONT_FAMILY, 10),
+                             fg=COLORS["text_secondary"], bg=COLORS["bg_surface"])
+        _lf_label.grid(row=19, column=0, sticky=tk.W, padx=(12, 8), pady=4)
+        self.labels["LOKR_FACTOR"] = _lf_label
+        self._lokr_factor_rowf = tk.Frame(training_content, bg=COLORS["bg_surface"])
+        self._lokr_factor_rowf.grid(row=19, column=1, columnspan=2, sticky=tk.W, padx=5, pady=4)
+        self.entries["LOKR_FACTOR"] = ttk.Entry(self._lokr_factor_rowf, width=8)
+        self.entries["LOKR_FACTOR"].insert(0, str(self.settings.get("LOKR_FACTOR", 8)))
+        self.entries["LOKR_FACTOR"].pack(side=tk.LEFT)
+        self._lokr_factor_hint = tk.Label(
+            self._lokr_factor_rowf,
+            text="8 is the sweet spot · 4 = stronger, bigger files · above 8: just use LoRA",
+            font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+            justify=tk.LEFT)
+        self._lokr_factor_hint.pack(side=tk.LEFT, padx=(10, 0))
+        self.rows["LOKR_FACTOR"] = {"row": 19, "label": _lf_label,
+                                    "entry": self._lokr_factor_rowf,
+                                    "browse": None, "parent": training_content}
+
         # Model Area to Train dropdown (blocks + timestep auto-fill)
         self._modelarea_label = ttk.Label(training_content, text="Model Area to Train:")
         self._modelarea_label.grid(row=10, column=0, sticky=tk.W, padx=5, pady=2)
@@ -3670,7 +3735,8 @@ class LoRATrainerGUI:
     # current family doesn't offer (cross-family last-train leak, withdrawn LR floors,
     # removed optimizers) must NOT be .set() onto them — readonly Comboboxes accept any
     # value without complaint, and the bad name then dies (or misbehaves) at launch.
-    _STRICT_COMBO_KEYS = {"OPTIMIZER_TYPE", "ADAPTIVE_LR_MIN", "ADAPTIVE_LR_MAX", "LR_SCHEDULER"}
+    _STRICT_COMBO_KEYS = {"OPTIMIZER_TYPE", "ADAPTIVE_LR_MIN", "ADAPTIVE_LR_MAX", "LR_SCHEDULER",
+                          "NETWORK_TYPE"}
 
     def _apply_preset_values(self, preset):
         """Apply preset values to the UI (shared by load_default_preset and load_custom_preset)"""
@@ -4345,8 +4411,19 @@ class LoRATrainerGUI:
                   self._krea2_autorecap_cb, self._krea2_warmuplook_cb,
                   self._krea2_losswatch_hint,
                   # torch.compile is wired into krea2_train only.
-                  self._compile_blocks_label, self.compile_blocks_check, self._compile_blocks_hint):
+                  self._compile_blocks_label, self.compile_blocks_check, self._compile_blocks_hint,
+                  # Network Type (LoRA/LoKR) is a krea2_train flag; Klein trains standard only.
+                  # The row frame carries the combo + hint together.
+                  self.labels["NETWORK_TYPE"], self._network_type_rowf):
             self._set_widget_visible(w, is_krea2)
+        if is_krea2:
+            # Restore the rank/alpha <-> factor row swap for the current selection.
+            self._on_network_type_changed()
+        else:
+            # Klein always shows rank/alpha and never the factor, whatever the combo holds.
+            self.show_row("NETWORK_DIM")
+            self.show_row("NETWORK_ALPHA")
+            self.hide_row("LOKR_FACTOR")
 
         # Custom block picker: always hidden under Krea 2; under Klein, let the Model-Area
         # dropdown decide (only shown when the preset is "Custom").
@@ -5058,6 +5135,16 @@ class LoRATrainerGUI:
                 _rk = int(self.entries["NETWORK_DIM"].get().strip() or 32)
             except (ValueError, KeyError, AttributeError):
                 _rk = 32
+            # LoKR: the hidden rank box is meaningless (baseline it at 32) and the factor
+            # carries the real state cost — params scale 1/factor², so factor 4 is ~+4 GB
+            # the budget must know about on tight cards.
+            _ntype = "lokr" if self._network_type_is_lokr() else "lora"
+            if _ntype == "lokr":
+                _rk = 32
+            try:
+                _lf = int(self.entries["LOKR_FACTOR"].get().strip() or 8)
+            except (ValueError, KeyError, AttributeError):
+                _lf = 8
             # If the user pinned the 4-bit control, the plan must be built AROUND that choice —
             # otherwise the swap count is sized for a quantisation that will not run. That
             # exact mismatch (fp8 given NF4's swap-0 plan) OOM'd 16 GB cards; reproduced and
@@ -5069,7 +5156,8 @@ class LoRATrainerGUI:
             # briefly making Off mean plain fp8 cost 20 GB+ cards the fastest path for nothing.
             _force = self._krea2_force_quant() if hasattr(self, "quant_4bit_mode_var") else None
             plan = recommend_krea2_strategy(caps=caps, mp=_mp, batch=_bs, rank=_rk,
-                                            force_quant=_force)
+                                            force_quant=_force,
+                                            network_type=_ntype, lokr_factor=_lf)
         except Exception:
             self._auto_quant_int8 = ""   # no strategy ran — a stale INT8 pick must not leak
             return self._auto_krea2_blocks_swap()
@@ -5353,6 +5441,25 @@ class LoRATrainerGUI:
             row_info["entry"].grid_remove()
             if row_info["browse"]:
                 row_info["browse"].grid_remove()
+
+    def _network_type_is_lokr(self) -> bool:
+        try:
+            return str(self.entries["NETWORK_TYPE"].get()).startswith("LoKR")
+        except (KeyError, tk.TclError):
+            return False
+
+    def _on_network_type_changed(self):
+        """LoKR has no rank/alpha — a single Factor dial replaces them, so the rows swap.
+        Only meaningful under Krea 2; the arch-visibility pass calls this on family switch."""
+        if self._network_type_is_lokr():
+            self.hide_row("NETWORK_DIM")
+            self.hide_row("NETWORK_ALPHA")
+            self.show_row("LOKR_FACTOR")   # hint lives inside the row frame, rides along
+        else:
+            self.show_row("NETWORK_DIM")
+            self.show_row("NETWORK_ALPHA")
+            self.hide_row("LOKR_FACTOR")
+        self._save_last_used_paths()
 
     def toggle_scaled(self):
         """Enable or disable the Scaled checkbox based on FP8 checkbox state"""
@@ -10304,7 +10411,12 @@ class LoRATrainerGUI:
         return max_idx + 1
 
     def _log(self, text):
-        """Append text to the convert log (preserves user scroll position)."""
+        """Append text to the convert log (preserves user scroll position). Marshals to the
+        main thread — Tk widget writes from a worker are a hard crash, not an exception."""
+        import threading
+        if threading.current_thread() is not threading.main_thread():
+            self.master.after(0, self._log, text)
+            return
         self._append_global_log(text)
         try:
             at_bottom = self.convert_log.yview()[1] >= 0.999
@@ -11135,17 +11247,8 @@ class LoRATrainerGUI:
                     return
             self._explorer_engine.load_primary(path)
             n_active = len(self._explorer_engine.primary_block_ids)
-            # Detect format for user info
-            from safetensors.torch import load_file as _lf
-            from fizgig.networks.lora import ensure_kohya_lora_state_dict as _ek, detect_lora_format as _df
-            _fmt = _df(_ek(_lf(path)))
-            if _fmt in ("lokr", "loha"):
-                messagebox.showinfo("LyCORIS LoRA loaded",
-                    f"This is a {_fmt.upper()} LoRA (LyCORIS format). "
-                    f"Preview and profiling work normally.\n\n"
-                    f"If you save, each block will be converted to standard LoRA via SVD. "
-                    f"This may take a minute or two for large LoRAs (GPU-accelerated when available). "
-                    f"The result is a slight approximation of the original.")
+            # LyCORIS loads and saves natively — nothing to announce on open; the save
+            # dialog states the format.
             self.explorer_status_var.set(
                 f"Loaded: {os.path.basename(path)} ({n_active}/32 blocks). Click Re-roll to start exploring.")
             # Initialize baseline state with user-specified LoRA strength
@@ -11262,10 +11365,18 @@ class LoRATrainerGUI:
             # Generate baseline (full forward, populates activation cache)
             engine._changed_blocks = set(baseline_state.blocks.keys())
             baseline_img = engine.generate_preview(baseline_state)
+            # Show the baseline the moment it exists — the image the user actually loaded
+            # must not wait behind four variant renders. Picking stays disabled until
+            # _explorer_on_results flips _explorer_generating, so early display is safe.
+            self.master.after(0, lambda: (
+                self._explorer_show_baseline(baseline_img),
+                self._explorer_update_state_text(baseline_state),
+                self._explorer_progress_var.set("Baseline ready — generating variant 1/4...")))
 
             # Generate 4 variants — each runs a full forward (invalidate activation
             # cache between variants so they don't contaminate each other).
             # The prompt cache is still shared, saving ~300-500ms per variant.
+            # Each variant appears in the gallery as soon as it renders.
             variant_images = []
             for i, vs in enumerate(variant_states):
                 self.master.after(0, lambda i=i: self._explorer_progress_var.set(
@@ -11274,6 +11385,7 @@ class LoRATrainerGUI:
                 engine._changed_blocks = set(vs.blocks.keys())
                 img = engine.generate_preview(vs)
                 variant_images.append(img)
+                self.master.after(0, lambda i=i, im=img: self._explorer_show_variant(i, im))
 
             self.master.after(0, lambda: self._explorer_on_results(
                 baseline_state, baseline_img, variant_states, variant_images))
@@ -11741,22 +11853,7 @@ class LoRATrainerGUI:
         if not lora_path:
             return
 
-        # Warn if LyCORIS — saving will require SVD materialization
-        try:
-            from safetensors.torch import load_file as _lf
-            from fizgig.networks.lora import ensure_kohya_lora_state_dict as _ek, detect_lora_format as _df
-            _fmt = _df(_ek(_lf(lora_path)))
-            if _fmt in ("lokr", "loha"):
-                proceed = messagebox.askyesno(
-                    "LyCORIS LoRA",
-                    f"This is a {_fmt.upper()} LoRA. Preview and editing work normally, "
-                    f"but saving will require SVD conversion (may take a minute).\n\n"
-                    f"Consider using the Extract tab to convert to standard LoRA first "
-                    f"for faster saves.\n\nContinue anyway?")
-                if not proceed:
-                    return
-        except Exception:
-            pass
+        # LyCORIS files now save natively (lossless) — the old SVD-warning gate is gone.
 
         baseline = self._explorer_baseline_state
 
@@ -11837,8 +11934,11 @@ class LoRATrainerGUI:
         from fizgig.networks.lora import UnsupportedLoRAFormat
         try:
             summary = save_repaired_lora(primary_path, self._explorer_baseline_state, out)
+            _fmt_note = ("\n\nSaved natively in LyCORIS format — lossless, no conversion."
+                         if summary.get('format_out') == 'lycoris' else "")
             messagebox.showinfo("Explored LoRA saved",
-                                f"Saved: {out}\n\nKeys: {summary['keys_in']} -> {summary['keys_out']}")
+                                f"Saved: {out}\n\nKeys: {summary['keys_in']} -> {summary['keys_out']}"
+                                + _fmt_note)
         except UnsupportedLoRAFormat as ex:
             messagebox.showerror("Unsupported LoRA format", str(ex))
         except Exception:
@@ -12286,7 +12386,12 @@ class LoRATrainerGUI:
             self._update_extract_output_name()
 
     def _extract_log(self, text):
-        """Append to extract log (preserves user scroll position)."""
+        """Append to extract log (preserves user scroll position). Marshals to the main
+        thread — the extract worker calls this from its own thread."""
+        import threading
+        if threading.current_thread() is not threading.main_thread():
+            self.master.after(0, self._extract_log, text)
+            return
         self._append_global_log(text)
         self._smart_text_insert(self.extract_log, text)
 
@@ -13680,7 +13785,12 @@ class LoRATrainerGUI:
             webbrowser.open(self._profiler_report_path)
 
     def _profiler_log(self, text):
-        """Append to profiler log (preserves user scroll position)."""
+        """Append to profiler log (preserves user scroll position). Marshals to the main
+        thread — the profiler worker calls this from its own thread."""
+        import threading
+        if threading.current_thread() is not threading.main_thread():
+            self.master.after(0, self._profiler_log, text)
+            return
         self._append_global_log(text)
         self._smart_text_insert(self.profiler_results, text)
 
@@ -17637,18 +17747,11 @@ class LoRATrainerGUI:
         try:
             self.repair_status_var.set("Loading primary LoRA…")
             self.master.update_idletasks()
-            # Detect format for user info
-            from safetensors.torch import load_file as _lf
-            from fizgig.networks.lora import ensure_kohya_lora_state_dict as _ek, detect_lora_format as _df
-            _fmt = _df(_ek(_lf(path)))
             self.repair_engine.load_primary(path)
             self._refresh_block_slider_activity()
             n_active = len(self.repair_engine.primary_block_ids)
-            if _fmt in ("lokr", "loha"):
-                messagebox.showinfo("LyCORIS LoRA loaded",
-                    f"This is a {_fmt.upper()} LoRA. Live preview works normally.\n\n"
-                    f"If you save, blocks will be converted to standard LoRA via SVD "
-                    f"(slight approximation).")
+            # LyCORIS loads and saves natively — no popup on open; the save dialog
+            # states the format (and the donor-blend SVD case warns at donor load).
             # Look up a matching Profiler sidecar by content hash and render
             # the inline info panel if one exists.
             self._find_repair_profile_match()
@@ -17676,17 +17779,9 @@ class LoRATrainerGUI:
         try:
             self.repair_status_var.set("Loading donor LoRA…")
             self.master.update_idletasks()
-            from safetensors.torch import load_file as _lf
-            from fizgig.networks.lora import ensure_kohya_lora_state_dict as _ek, detect_lora_format as _df
-            _fmt_d = _df(_ek(_lf(path)))
             self.repair_engine.load_donor(path)
-            if _fmt_d in ("lokr", "loha"):
-                messagebox.showinfo("LyCORIS donor loaded",
-                    f"This donor is a {_fmt_d.upper()} LoRA (LyCORIS format). "
-                    f"Live preview works normally.\n\n"
-                    f"If you save with blended blocks, they will be converted to standard "
-                    f"LoRA via SVD. This may take a minute or two for large LoRAs "
-                    f"(GPU-accelerated when available).")
+            # No popup on open (LyCORIS donors save natively; only blended blocks SVD, and
+            # the save dialog reports exactly how many were).
             self._repair_donor_loaded = True
             # Show donor sub-rows + master section toggles + enable the "Donor" master target radio
             for vars_ in self.repair_block_vars.values():
@@ -18100,6 +18195,11 @@ class LoRATrainerGUI:
             )
             if summary['blended_blocks']:
                 msg += "\n\nNote: blended blocks have rank = rank_primary + rank_donor. File size grows proportionally."
+            if summary.get('format_out') == 'lycoris':
+                msg += "\n\nSaved natively in LyCORIS format (LoKR/LoHa) — lossless, no conversion."
+            elif summary.get('lycoris_converted'):
+                msg += (f"\n\n{summary['lycoris_converted']} blended LyCORIS module(s) were "
+                        f"converted to standard LoRA via SVD; everything else stayed native.")
             messagebox.showinfo("Repaired LoRA saved", msg)
         except UnsupportedLoRAFormat as ex:
             messagebox.showerror("Bake not supported for this LoRA format", str(ex))
@@ -18169,15 +18269,7 @@ class LoRATrainerGUI:
             from safetensors.torch import load_file as _lf
             from fizgig.networks.lora import ensure_kohya_lora_state_dict as _ek, detect_lora_format as _df
             _fmt = _df(_ek(_lf(lora_path)))
-            if _fmt in ("lokr", "loha"):
-                proceed = messagebox.askyesno(
-                    "LyCORIS LoRA",
-                    f"This is a {_fmt.upper()} LoRA. Explorer preview works normally, "
-                    f"but saving will require SVD conversion (may take a minute).\n\n"
-                    f"Consider using the Extract tab to convert to standard LoRA first "
-                    f"for faster saves.\n\nContinue anyway?")
-                if not proceed:
-                    return
+            # LyCORIS saves natively now (lossless) — no SVD gate needed on the handoff.
         except Exception:
             pass
 
@@ -18880,6 +18972,8 @@ class LoRATrainerGUI:
             _check_num("Learning Rate", self.entries["LEARNING_RATE"].get(), float, 0)
         _check_num("Network Dim (Rank)", self.entries["NETWORK_DIM"].get(), int, 1)
         _check_num("Network Alpha", self.entries["NETWORK_ALPHA"].get(), float, 0)
+        if self._network_type_is_lokr():
+            _check_num("LoKR Factor", self.entries["LOKR_FACTOR"].get(), int, 2)
         _check_num("Max Train Epochs", self.entries["MAX_TRAIN_EPOCHS"].get(), int, 1)
         _check_num("Save Every N Epochs", self.entries["SAVE_EVERY_N_EPOCHS"].get(), int, 1)
         _check_num("Seed", self.entries["SEED"].get(), int)
@@ -19263,6 +19357,8 @@ class LoRATrainerGUI:
             "LORA_LR_RATIO": int(self.entries["LORA_LR_RATIO"].get()),
             "NETWORK_DIM": int(self.entries["NETWORK_DIM"].get()),
             "NETWORK_ALPHA": float(self.entries["NETWORK_ALPHA"].get()),
+            "NETWORK_TYPE": self.entries["NETWORK_TYPE"].get(),
+            "LOKR_FACTOR": int(self.entries["LOKR_FACTOR"].get() or 8),
             "MAX_TRAIN_EPOCHS": int(self.entries["MAX_TRAIN_EPOCHS"].get()),
             "SAVE_EVERY_N_EPOCHS": int(self.entries["SAVE_EVERY_N_EPOCHS"].get()),
             "SEED": int(self.entries["SEED"].get()),
@@ -19908,6 +20004,11 @@ class LoRATrainerGUI:
             "--seed", str(self.settings["SEED"]),
             "--discrete_flow_shift", "2.5",
         ]
+        # LoKR (Kronecker) — dim/alpha still ride along above but the trainer ignores them;
+        # the factor is the dial. Klein's builder never reads NETWORK_TYPE (standard only).
+        if str(self.settings.get("NETWORK_TYPE", "")).startswith("LoKR"):
+            cmd += ["--network_type", "lokr",
+                    "--lokr_factor", str(self.settings.get("LOKR_FACTOR", 8))]
         # State saving. Krea 2 previously wrote state ONLY on Pause, so a crash or a run that
         # finished too early meant starting over. Pause still saves regardless of these flags.
         cmd += self._state_flags()
