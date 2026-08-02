@@ -6322,6 +6322,25 @@ class LoRATrainerGUI:
         p = self._krea2_pref("krea2_text_encoder") if hasattr(self, "prefs_vars") else ""
         return p if (p and os.path.isfile(p)) else ""
 
+    def _qwen_captioner_path_8b(self) -> str:
+        """The 8B variant of the Krea 2 text encoder, if set and on disk — else ""."""
+        p = self._krea2_pref("krea2_text_encoder_8b") if hasattr(self, "prefs_vars") else ""
+        return p if (p and os.path.isfile(p)) else ""
+
+    def _qwen_captioner_hint(self) -> str:
+        """Small nudge next to the Model dropdown when no Qwen3-VL variant is offered — someone
+        who already has the weights (from ComfyUI, a pod image, wherever) has no other way to
+        learn that this is an unset/broken Preferences path rather than a missing feature."""
+        if self._qwen_captioner_path() or self._qwen_captioner_path_8b():
+            return ""
+        raw4 = self._krea2_pref("krea2_text_encoder") if hasattr(self, "prefs_vars") else ""
+        raw8 = self._krea2_pref("krea2_text_encoder_8b") if hasattr(self, "prefs_vars") else ""
+        if raw4:
+            return f"(Qwen3-VL 4B path set but not found: {os.path.basename(raw4)} — check Preferences)"
+        if raw8:
+            return f"(Qwen3-VL 8B path set but not found: {os.path.basename(raw8)} — check Preferences)"
+        return "(Already have the Qwen3-VL weights? Set the path in Preferences to caption with it)"
+
     def _caption_model_values(self):
         """Model dropdown contents. Each Qwen3-VL variant is offered whenever its file exists —
         they caption to .txt like Florence does, so they serve Klein datasets just as well as
