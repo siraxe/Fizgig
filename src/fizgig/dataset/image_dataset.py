@@ -137,6 +137,52 @@ def resize_image_to_bucket(image: Union[Image.Image, np.ndarray], bucket_reso: T
     return arr[crop_top: crop_top + bucket_height, crop_left: crop_left + bucket_width]
 
 
+def find_stem_matched_file(
+    directory: Optional[str],
+    stem: str,
+    extensions: Optional[Sequence[str]] = None,
+) -> Optional[str]:
+    """Return the first file in *directory* whose stem matches, or None.
+
+    Tries each extension in turn (default :data:`IMAGE_EXTENSIONS`), then falls back
+    to a no-extension sibling of the same name. Used to pair mask files to images.
+    """
+    if directory is None:
+        return None
+    extensions = extensions if extensions is not None else IMAGE_EXTENSIONS
+    for ext in extensions:
+        candidate = os.path.join(directory, stem + ext)
+        if os.path.exists(candidate):
+            return candidate
+    candidate_dir = os.path.join(directory, stem)
+    if os.path.isdir(candidate_dir):
+        return candidate_dir
+    return None
+
+
+def load_loss_mask_image(mask_path: str, *, invert: bool = False) -> Image.Image:
+    """Load a single-channel mask. Uses alpha if present, else luminance."""
+    mask = Image.open(mask_path)
+    if "A" in mask.getbands():
+        mask = mask.getchannel("A")
+    else:
+        mask = mask.convert("L")
+    if invert:
+        from PIL import ImageOps
+        mask = ImageOps.invert(mask)
+    return mask
+
+
+def loss_mask_to_float_array(mask: Union[Image.Image, np.ndarray], bucket_reso: Tuple[int, int]) -> np.ndarray:
+    """Resize *mask* to *bucket_reso* ``(width, height)`` and normalise to ``[0, 1]`` float32."""
+    if isinstance(mask, Image.Image) and mask.mode != "L":
+        mask = mask.convert("L")
+    arr = resize_image_to_bucket(mask, bucket_reso)
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    return arr.astype(np.float32) / 255.0
+
+
 # ---------------------------------------------------------------------------
 # ItemInfo
 # ---------------------------------------------------------------------------
@@ -161,6 +207,7 @@ class ItemInfo:
         self.latent_cache_path = latent_cache_path
         self.text_encoder_output_cache_path: Optional[str] = None
         self.control_content: Optional[list[np.ndarray]] = None
+        self.mask_content: Optional[np.ndarray] = None  # (H, W) float32 in [0, 1]
 
     def __str__(self) -> str:
         content_shape = None
@@ -189,8 +236,14 @@ def save_latent_cache(
     item_info: ItemInfo,
     latent: torch.Tensor,
     control_latent: Optional[list[torch.Tensor]] = None,
+    mask_latent: Optional[torch.Tensor] = None,
 ) -> None:
-    """Save latent cache for Klein 9B (3-D latent: C, H, W)."""
+    """Save latent cache for Klein 9B (3-D latent: C, H, W).
+
+    ``mask_latent`` is the downsampled loss mask at latent spatial resolution,
+    shape ``(1, h, w)`` float32 in [0, 1]. Stored under ``mask_{h}x{w}`` so the
+    batch loader can route it via the ``mask_`` prefix.
+    """
     assert latent.dim() == 3, f"latent must be 3-D (C,H,W), got {latent.shape}"
 
     _, H, W = latent.shape
@@ -201,6 +254,11 @@ def save_latent_cache(
             assert cl.dim() == 3, f"control_latent[{i}] must be 3-D, got {cl.shape}"
             _, cH, cW = cl.shape
             sd[f"latent_control_{i}_{cH}x{cW}"] = cl.detach().cpu().contiguous()
+
+    if mask_latent is not None:
+        assert mask_latent.dim() == 3, f"mask_latent must be 3-D (1,h,w), got {mask_latent.shape}"
+        _, mH, mW = mask_latent.shape
+        sd[f"mask_{mH}x{mW}"] = mask_latent.detach().cpu().contiguous().float()
 
     metadata = {
         "architecture": ARCHITECTURE_KLEIN_9B_FULL,
@@ -398,12 +456,18 @@ class BucketBatchManager:
         start = batch_idx * self.batch_size
         end = min(start + self.batch_size, len(bucket))
 
+        items_in_batch = bucket[start:end]
         batch_tensor_data: dict[str, list[torch.Tensor]] = {}
+        # Track which items contributed a loss_mask so we can enforce all-or-none per batch.
+        # Mixed batches (some caches with mask_, some without) would stack-fail anyway; we want
+        # a clearer error pointing at the offending cache file.
+        items_with_mask: list[str] = []
 
-        for item_info in bucket[start:end]:
+        for item_info in items_in_batch:
             sd_latent = load_file(item_info.latent_cache_path)
             sd_te = load_file(item_info.text_encoder_output_cache_path)
             sd = {**sd_latent, **sd_te}
+            has_mask_key = False
 
             for key, tensor in sd.items():
                 # Map Fizgig-native keys to training batch keys
@@ -414,6 +478,10 @@ class BucketBatchManager:
                 elif key.startswith("latent_"):
                     # latent_{H}x{W} -> latents
                     content_key = "latents"
+                elif key.startswith("mask_"):
+                    # mask_{H}x{W} -> loss_mask
+                    content_key = "loss_mask"
+                    has_mask_key = True
                 elif key == "text_embed":
                     content_key = "ctx_vec"
                 elif key in ("hidden_states", "attention_mask"):
@@ -430,6 +498,21 @@ class BucketBatchManager:
                     batch_tensor_data[content_key] = []
                 batch_tensor_data[content_key].append(tensor)
 
+            if has_mask_key:
+                items_with_mask.append(item_info.item_key)
+
+        if 0 < len(items_with_mask) < len(items_in_batch):
+            missing = [
+                os.path.basename(it.latent_cache_path)
+                for it in items_in_batch
+                if it.item_key not in items_with_mask
+            ]
+            raise RuntimeError(
+                "Mixed mask coverage inside one batch: some cache files have a `mask_*` key "
+                f"and others don't. Missing mask key in: {missing}. "
+                "Re-run cache_latents.py so every cache is consistent."
+            )
+
         # Stack tensors per key
         stacked: dict[str, Any] = {}
         for key, tensors in batch_tensor_data.items():
@@ -442,7 +525,7 @@ class BucketBatchManager:
 
         # Per-image identity for the (passive) per-image loss logger. Harmless list of strings that
         # trainers ignore unless logging is enabled.
-        stacked["item_keys"] = [item_info.item_key for item_info in bucket[start:end]]
+        stacked["item_keys"] = [item_info.item_key for item_info in items_in_batch]
 
         return stacked
 
@@ -452,19 +535,22 @@ class BucketBatchManager:
 # ---------------------------------------------------------------------------
 
 class ImageDirectoryDatasource:
-    """Loads images (and optional control images) from a directory on disk."""
+    """Loads images (and optional control/mask images) from a directory on disk."""
 
     def __init__(
         self,
         image_directory: str,
         caption_extension: Optional[str] = None,
         control_directory: Optional[str] = None,
+        mask_directory: Optional[str] = None,
     ):
         self.image_directory = image_directory
         self.caption_extension = caption_extension
         self.control_directory = control_directory
+        self.mask_directory = mask_directory
         self.caption_only = False
         self.has_control = False
+        self.has_mask = False
         self._current_idx = 0
 
         logger.info(f"glob images in {self.image_directory}")
@@ -505,6 +591,23 @@ class ImageDirectoryDatasource:
 
             logger.info(f"found {len(self.control_paths)} matching control image sets")
 
+        # Optional loss masks. Activates only when at least one image has a stem-matched
+        # mask file — zero matches is a silent no-op so an empty/`masks` folder doesn't
+        # derail caching or training.
+        if self.mask_directory is not None:
+            logger.info(f"glob mask images in {self.mask_directory}")
+            self.mask_paths: dict[str, str] = {}
+            for img_path in self.image_paths:
+                stem = os.path.splitext(os.path.basename(img_path))[0]
+                mask_path = find_stem_matched_file(self.mask_directory, stem)
+                if mask_path is not None:
+                    self.mask_paths[img_path] = mask_path
+            self.has_mask = len(self.mask_paths) >= 1
+            logger.info(
+                f"found {len(self.mask_paths)} matching mask images "
+                f"({'masked training active' if self.has_mask else 'no matches — masks disabled'})"
+            )
+
     def set_caption_only(self, caption_only: bool):
         self.caption_only = caption_only
 
@@ -514,7 +617,9 @@ class ImageDirectoryDatasource:
     def __len__(self):
         return len(self.image_paths)
 
-    def get_image_data(self, idx: int) -> Tuple[str, list[Image.Image], str, Optional[list[Image.Image]]]:
+    def get_image_data(
+        self, idx: int
+    ) -> Tuple[str, list[Image.Image], str, Optional[list[Image.Image]], Optional[Image.Image]]:
         image_path = self.image_paths[idx]
         img = Image.open(image_path)
         if img.mode not in ("RGB", "RGBA"):
@@ -531,7 +636,13 @@ class ImageDirectoryDatasource:
                     c = c.convert("RGB")
                 controls.append(c)
 
-        return image_path, [img], caption, controls
+        mask = None
+        if self.has_mask:
+            mask_path = self.mask_paths.get(image_path)
+            if mask_path is not None:
+                mask = load_loss_mask_image(mask_path)
+
+        return image_path, [img], caption, controls, mask
 
     def get_caption(self, idx: int) -> Tuple[str, str]:
         image_path = self.image_paths[idx]
@@ -576,6 +687,7 @@ class ImageDataset(torch.utils.data.Dataset):
         bucket_no_upscale: bool,
         image_directory: Optional[str] = None,
         control_directory: Optional[str] = None,
+        mask_directory: Optional[str] = None,
         cache_directory: Optional[str] = None,
         debug_dataset: bool = False,
         architecture: str = ARCHITECTURE_KLEIN_9B,
@@ -590,6 +702,7 @@ class ImageDataset(torch.utils.data.Dataset):
         self.bucket_no_upscale = bucket_no_upscale if enable_bucket else False
         self.image_directory = image_directory
         self.control_directory = control_directory
+        self.mask_directory = mask_directory
         self.cache_directory = cache_directory
         self.debug_dataset = debug_dataset
         self.architecture = architecture
@@ -602,7 +715,9 @@ class ImageDataset(torch.utils.data.Dataset):
         if image_directory is None:
             raise ValueError("image_directory must be specified")
 
-        self.datasource = ImageDirectoryDatasource(image_directory, caption_extension, control_directory)
+        self.datasource = ImageDirectoryDatasource(
+            image_directory, caption_extension, control_directory, mask_directory
+        )
 
         if self.cache_directory is None:
             self.cache_directory = self.image_directory
@@ -610,6 +725,7 @@ class ImageDataset(torch.utils.data.Dataset):
         self.batch_manager: Optional[BucketBatchManager] = None
         self.num_train_items = 0
         self.has_control = self.datasource.has_control
+        self.has_mask = self.datasource.has_mask
 
     # -- metadata ----------------------------------------------------------
 
@@ -627,6 +743,9 @@ class ImageDataset(torch.utils.data.Dataset):
         if self.control_directory is not None:
             metadata["control_directory"] = os.path.basename(self.control_directory)
         metadata["has_control"] = self.has_control
+        if self.mask_directory is not None:
+            metadata["mask_directory"] = os.path.basename(self.mask_directory)
+        metadata["has_mask"] = self.has_mask
         return metadata
 
     def get_total_image_count(self) -> Optional[int]:
@@ -672,7 +791,7 @@ class ImageDataset(torch.utils.data.Dataset):
                         break
 
                 for future in completed:
-                    original_size, item_key, images, caption, controls = future.result()
+                    original_size, item_key, images, caption, controls, mask = future.result()
                     image = images[0]
                     bucket_h, bucket_w = image.shape[:2]
                     bucket_reso = (bucket_w, bucket_h)
@@ -691,6 +810,9 @@ class ImageDataset(torch.utils.data.Dataset):
                         extra = tuple(s for ctrl in controls for s in ctrl.shape[:2])
                         bkey = bucket_reso + extra
 
+                    if mask is not None:
+                        item_info.mask_content = loss_mask_to_float_array(mask, bucket_reso)
+
                     batches.setdefault(bkey, []).append(item_info)
                     futures.remove(future)
 
@@ -707,7 +829,7 @@ class ImageDataset(torch.utils.data.Dataset):
 
         for fetch_op in self.datasource:
             def fetch_and_resize(op=fetch_op):
-                image_key, images, caption, controls = op()
+                image_key, images, caption, controls, mask = op()
                 image: Image.Image = images[0]
                 image_size = image.size
                 bucket_reso = bucket_selector.get_bucket_resolution(image_size)
@@ -716,7 +838,11 @@ class ImageDataset(torch.utils.data.Dataset):
                 resized_controls = None
                 if controls is not None:
                     resized_controls = [resize_image_to_bucket(c, bucket_reso) for c in controls]
-                return image_size, image_key, resized, caption, resized_controls
+
+                resized_mask = None
+                if mask is not None:
+                    resized_mask = loss_mask_to_float_array(mask, bucket_reso)
+                return image_size, image_key, resized, caption, resized_controls, resized_mask
 
             future = executor.submit(fetch_and_resize)
             futures.append(future)

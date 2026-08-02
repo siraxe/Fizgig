@@ -53,7 +53,7 @@ def main():
     vae = load_vae(args.vae, input_channels=3, device=device, disable_mmap=True)
     vae.to(device)
 
-    encode_datasets(datasets, lambda batch: encode_and_save_latents(vae, batch), args)
+    encode_datasets(datasets, lambda batch, dataset: encode_and_save_latents(vae, batch), args)
 
 
 if __name__ == "__main__":

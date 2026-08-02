@@ -5902,7 +5902,8 @@ class LoRATrainerGUI:
             fr_ps_row, "Add Prefix / Suffix / Rename",
             "Prepend or append the same text to every `.txt` caption in the image folder "
             "(skips captions that already start/end with it). 'Rename Files' renames every "
-            "image and its paired `.txt` to `<text>_<NNNN>` starting at _0000.",
+            "image, its paired `.txt`, and any stem-matched controls/masks in sibling "
+            "`control/` and `masks/` folders to `<text>_<NNNN>` starting at _0000.",
             grid_args={"row": 0, "column": 1, "sticky": "nsew", "padx": (8, 0)},
             wraplength=360,
         )
@@ -7241,12 +7242,15 @@ class LoRATrainerGUI:
             self.refresh_caption_images()
 
     def rename_dataset_files(self):
-        """Rename every image in the image folder (and its paired `.txt` caption) to
-        `<text>_<NNNN>` using the Prefix/Suffix Text field, zero-padded to 4 digits starting
-        at _0000. Two-phase rename via unique temp names keeps source and target namespaces
-        from colliding when a source already matches the target pattern; numbers already
-        taken by unmanaged files (anything in the folder that isn't an image or its paired
-        caption) are skipped so nothing is overwritten."""
+        """Rename every image in the image folder (and its paired `.txt` caption, plus any
+        stem-matched controls in a sibling ``control/`` folder and mask in a sibling
+        ``masks/`` folder) to ``<text>_<NNNN>`` using the Prefix/Suffix Text field,
+        zero-padded to 4 digits starting at _0000. Two-phase rename via unique temp names
+        keeps source and target namespaces from colliding when a source already matches the
+        target pattern; numbers already taken by unmanaged files (anything in the folder
+        that isn't an image or its paired caption/controls/mask) are skipped so nothing is
+        overwritten. Control suffix variants (``image_01.png``, ``image_02.png``) keep
+        their suffix — only the stem is swapped."""
         folder = self.image_folder_var.get().strip() if hasattr(self, "image_folder_var") else ""
         if not folder or not os.path.isdir(folder):
             messagebox.showerror("Error", "Please select a valid folder")
@@ -7278,82 +7282,163 @@ class LoRATrainerGUI:
             messagebox.showerror("Error", "No image files found in the folder")
             return
 
-        # Phase 1: stage each image (and its paired .txt if present) under a unique temp
-        # name. Clearing the source namespace first means a source named `box_0000.jpg`
-        # can't collide with the `box_0000.jpg` we want to create in Phase 2.
+        # Sibling control/ and masks/ folders — pairs in them must be renamed in lockstep so
+        # the dataset loader's stem-match keeps finding them after the rename.
+        ctrl_dir = os.path.join(folder, "control")
+        mask_dir = os.path.join(folder, "masks")
+        has_ctrl_dir = os.path.isdir(ctrl_dir)
+        has_mask_dir = os.path.isdir(mask_dir)
+        ctrl_entries = os.listdir(ctrl_dir) if has_ctrl_dir else []
+        mask_entries = os.listdir(mask_dir) if has_mask_dir else []
+
+        # Phase 1: stage every image's full pair set (image + caption + controls + mask)
+        # under unique temp names. Clearing the source namespace first means a source named
+        # `box_0000.jpg` can't collide with the `box_0000.jpg` we want to create in Phase 2.
         temp_prefix = f"~~fizgig_rename_{time.time_ns()}_"
-        staged = []  # list of (tmp_img, tmp_txt_or_None)
+        counter = [0]  # boxed so the closure can mutate it
+
+        def unique_temp(directory: str, ext: str) -> str:
+            while True:
+                path = os.path.join(directory, f"{temp_prefix}{counter[0]}{ext}")
+                counter[0] += 1
+                if not os.path.exists(path):
+                    return path
+
+        staged = []  # list of dicts per image
         errors = 0
-        counter = 0
         for img_file in image_files:
             root, ext = os.path.splitext(img_file)
-            txt_file = root + ".txt"
-            tmp_txt = None
-            if os.path.isfile(txt_file):
-                tmp_txt = os.path.join(folder, f"{temp_prefix}{counter}.txt")
-                while os.path.exists(tmp_txt):
-                    counter += 1
-                    tmp_txt = os.path.join(folder, f"{temp_prefix}{counter}.txt")
-            tmp_img = os.path.join(folder, f"{temp_prefix}{counter}{ext}")
-            while os.path.exists(tmp_img):
-                counter += 1
-                tmp_img = os.path.join(folder, f"{temp_prefix}{counter}{ext}")
+            img_stem = os.path.basename(root)
+
+            # Paired caption (same stem, .txt, in image folder)
+            txt_path = root + ".txt"
+            has_txt = os.path.isfile(txt_path)
+
+            # Controls: match the dataset loader's prefix rules. cbase == stem (exact, any ext)
+            # OR cbase starts with stem+"_" (suffixed variants — preserve the suffix).
+            ctrl_matches = []  # (src_path, suffix, ext)
+            for ce in ctrl_entries:
+                cbase, cext = os.path.splitext(ce)
+                if cext.lower() not in image_exts:
+                    continue
+                if cbase == img_stem:
+                    ctrl_matches.append((os.path.join(ctrl_dir, ce), "", cext))
+                elif cbase.startswith(img_stem + "_"):
+                    ctrl_matches.append((os.path.join(ctrl_dir, ce), cbase[len(img_stem):], cext))
+
+            # Mask: exact stem match, any image extension. One per image at most.
+            mask_match = None  # (src_path, ext)
+            for me in mask_entries:
+                mbase, mext = os.path.splitext(me)
+                if mext.lower() in image_exts and mbase == img_stem:
+                    mask_match = (os.path.join(mask_dir, me), mext)
+                    break
+
+            # Pre-allocate every temp path so all are unique before any rename happens.
+            tmp_img = unique_temp(folder, ext)
+            tmp_txt = unique_temp(folder, ".txt") if has_txt else None
+            tmp_ctrls = [(unique_temp(ctrl_dir, cext), suffix, cext) for (_, suffix, cext) in ctrl_matches]
+            tmp_mask = unique_temp(mask_dir, mask_match[1]) if mask_match is not None else None
+
+            # Execute the renames; on any failure, roll back everything that succeeded in
+            # THIS iteration so the original layout isn't left half-staged.
+            done = []  # (tmp, original_src) pairs that succeeded
             try:
                 os.rename(img_file, tmp_img)
+                done.append((tmp_img, img_file))
                 if tmp_txt is not None:
-                    os.rename(txt_file, tmp_txt)
+                    os.rename(txt_path, tmp_txt)
+                    done.append((tmp_txt, txt_path))
+                for (src, _, _), tmp_pair in zip(ctrl_matches, tmp_ctrls):
+                    os.rename(src, tmp_pair[0])
+                    done.append((tmp_pair[0], src))
+                if tmp_mask is not None:
+                    os.rename(mask_match[0], tmp_mask)
+                    done.append((tmp_mask, mask_match[0]))
             except Exception as e:
                 errors += 1
                 self.update_caption_log(f"Error staging {os.path.basename(img_file)}: {e}\n")
-                # Best-effort rollback so the original isn't orphaned under a temp name.
-                try:
-                    if os.path.exists(tmp_img) and not os.path.exists(img_file):
-                        os.rename(tmp_img, img_file)
-                except Exception:
-                    pass
+                for tmp, src in reversed(done):
+                    try:
+                        os.rename(tmp, src)
+                    except Exception:
+                        pass
                 continue
-            staged.append((tmp_img, tmp_txt))
-            counter += 1
 
-        # Numbers taken by files we don't manage (anything left in the folder matching the
-        # target pattern that isn't one of our temp names) must be skipped so we don't overwrite.
+            staged.append({
+                "img_tmp": tmp_img, "img_ext": ext,
+                "txt_tmp": tmp_txt,
+                "ctrl_tmps": tmp_ctrls,  # list of (tmp_path, suffix, ext)
+                "mask_tmp": tmp_mask, "mask_ext": mask_match[1] if mask_match else None,
+            })
+
+        # Numbers taken by unmanaged files anywhere we'd write (image / control / masks dirs)
+        # must be skipped so we don't overwrite a pre-existing pair from a previous run.
         used = set()
         pattern = re.compile(rf"^{re.escape(text)}_(\d{{4}})$")
-        for name in os.listdir(folder):
-            if name.startswith(temp_prefix):
-                continue
-            m = pattern.match(os.path.splitext(name)[0])
-            if m:
-                used.add(int(m.group(1)))
+        for d in [folder] + ([ctrl_dir] if has_ctrl_dir else []) + ([mask_dir] if has_mask_dir else []):
+            try:
+                for name in os.listdir(d):
+                    if name.startswith(temp_prefix):
+                        continue
+                    m = pattern.match(os.path.splitext(name)[0])
+                    if m:
+                        used.add(int(m.group(1)))
+            except Exception:
+                pass
 
         # Phase 2: rename temp -> final, assigning sequential numbers and skipping used ones.
         renamed = 0
+        ctrl_renamed = 0
+        mask_renamed = 0
         next_num = 0
-        for tmp_img, tmp_txt in staged:
+        for entry in staged:
             while next_num in used:
                 next_num += 1
-            ext = os.path.splitext(tmp_img)[1]
-            final_img = os.path.join(folder, f"{text}_{next_num:04d}{ext}")
+            new_stem = f"{text}_{next_num:04d}"
+            final_img = os.path.join(folder, new_stem + entry["img_ext"])
             try:
-                os.rename(tmp_img, final_img)
+                os.rename(entry["img_tmp"], final_img)
             except Exception as e:
                 errors += 1
                 self.update_caption_log(f"Error renaming to {os.path.basename(final_img)}: {e}\n")
                 next_num += 1
                 continue
-            if tmp_txt is not None:
-                final_txt = os.path.join(folder, f"{text}_{next_num:04d}.txt")
+            if entry["txt_tmp"] is not None:
+                final_txt = os.path.join(folder, new_stem + ".txt")
                 try:
-                    os.rename(tmp_txt, final_txt)
+                    os.rename(entry["txt_tmp"], final_txt)
                 except Exception as e:
                     errors += 1
                     self.update_caption_log(f"Error renaming caption to {os.path.basename(final_txt)}: {e}\n")
+            for tmp, suffix, cext in entry["ctrl_tmps"]:
+                final_ctrl = os.path.join(ctrl_dir, new_stem + suffix + cext)
+                try:
+                    os.rename(tmp, final_ctrl)
+                    ctrl_renamed += 1
+                except Exception as e:
+                    errors += 1
+                    self.update_caption_log(f"Error renaming control to {os.path.basename(final_ctrl)}: {e}\n")
+            if entry["mask_tmp"] is not None:
+                final_mask = os.path.join(mask_dir, new_stem + entry["mask_ext"])
+                try:
+                    os.rename(entry["mask_tmp"], final_mask)
+                    mask_renamed += 1
+                except Exception as e:
+                    errors += 1
+                    self.update_caption_log(f"Error renaming mask to {os.path.basename(final_mask)}: {e}\n")
             used.add(next_num)
             next_num += 1
             renamed += 1
 
+        extra = []
+        if ctrl_renamed:
+            extra.append(f"{ctrl_renamed} control(s)")
+        if mask_renamed:
+            extra.append(f"{mask_renamed} mask(s)")
+        extra_str = f" (+ {', '.join(extra)})" if extra else ""
         self.update_caption_log(
-            f"Renamed {renamed} image(s) (+ captions) to '{text}_NNNN'"
+            f"Renamed {renamed} image(s){extra_str} to '{text}_NNNN'"
             + (f"; {errors} error(s)" if errors else "") + "\n"
         )
         if renamed:
@@ -19012,6 +19097,10 @@ class LoRATrainerGUI:
                         _ctrl_dir = image_dir.rstrip("/") + "/control"
                         if os.path.isdir(_ctrl_dir):
                             toml_lines.append(f'control_directory = "{_ctrl_dir}"')
+                        # Auto-detect a sibling "masks" subfolder the same way — paired by stem at load time.
+                        _mask_dir = image_dir.rstrip("/") + "/masks"
+                        if os.path.isdir(_mask_dir):
+                            toml_lines.append(f'mask_directory = "{_mask_dir}"')
 
             if cache_dir:
                 toml_lines.append(f'cache_directory = "{cache_dir.replace(chr(92), "/")}"')

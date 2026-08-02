@@ -55,6 +55,7 @@ from fizgig.klein.model_utils import (
 from fizgig.klein.position import prc_img, prc_txt, scatter_ids, pack_control_latent
 from fizgig.modules.schedulers import FlowMatchDiscreteScheduler, RexLR
 from fizgig.training.metadata import build_metadata, ARCHITECTURE_KLEIN_9B, ARCHITECTURE_KLEIN_9B_FULL
+from fizgig.training.losses import apply_loss_mask
 from fizgig.training.train_utils import (
     LossRecorder,
     get_epoch_ckpt_name,
@@ -2564,7 +2565,12 @@ class KleinTrainer:
                     loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target, reduction="none")
                     if weighting is not None:
                         loss = loss * weighting
-                    noise_loss = loss.mean()
+                    loss_mask = batch.get("loss_mask")
+                    if loss_mask is not None:
+                        noise_loss, mask_metrics = apply_loss_mask(loss, loss_mask)
+                    else:
+                        noise_loss = loss.mean()
+                        mask_metrics = {}
 
                     loss = noise_loss
 
@@ -2639,6 +2645,8 @@ class KleinTrainer:
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
                 avr_loss: float = loss_recorder.moving_average
                 logs = {"avr_loss": avr_loss}
+                if mask_metrics:
+                    logs["mask_active"] = mask_metrics["mask_active"]
                 progress_bar.set_postfix(**logs)
 
                 if args.scale_weight_norms:
@@ -2649,6 +2657,10 @@ class KleinTrainer:
                         args, current_loss, avr_loss, lr_scheduler, lr_descriptions,
                         optimizer, keys_scaled, mean_norm, maximum_norm,
                     )
+                    if mask_metrics:
+                        logs["mask/active"] = mask_metrics["mask_active"]
+                        logs["mask/loss_masked"] = mask_metrics["loss_masked"]
+                        logs["mask/loss_unmasked"] = mask_metrics["loss_unmasked"]
                     accelerator.log(logs, step=global_step)
 
                 if _perf_diag:

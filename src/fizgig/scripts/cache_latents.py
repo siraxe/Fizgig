@@ -8,7 +8,7 @@ import argparse
 import logging
 import os
 import sys
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -18,7 +18,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from fizgig.dataset.config import BlueprintGenerator, ConfigSanitizer, generate_dataset_group_by_blueprint, load_user_config
-from fizgig.dataset.image_dataset import ItemInfo, save_latent_cache
+from fizgig.dataset.image_dataset import ItemInfo, save_latent_cache, LATENT_SPATIAL_FACTOR
 from fizgig.klein.model_utils import KLEIN_MODEL_INFO, load_vae, add_model_version_args
 from fizgig.training.metadata import ARCHITECTURE_KLEIN_9B_FULL
 
@@ -36,8 +36,14 @@ DTYPE_MAP = {
 }
 
 
-def preprocess_images(batch: List[ItemInfo]) -> tuple:
-    """Convert image batch to normalized tensor for VAE encoding."""
+def preprocess_images(batch: List[ItemInfo], has_mask: bool = False) -> tuple:
+    """Convert image batch to normalized tensor for VAE encoding.
+
+    Returns ``(contents, controls, masks)``. ``masks`` is a list of ``(H, W)``
+    float32 arrays in [0, 1] — synthesised as all-ones for items lacking a real
+    mask when ``has_mask`` is True (so every cache file in a masked dataset is
+    consistent). ``None`` when the dataset has no masks at all.
+    """
     contents = []
     for item in batch:
         content = item.content
@@ -59,12 +65,28 @@ def preprocess_images(batch: List[ItemInfo]) -> tuple:
     else:
         controls = None
 
-    return contents, controls
+    # Handle loss masks. When has_mask is True every item contributes an array —
+    # real mask if present, all-ones fallback so unmasked images train normally.
+    masks: Optional[list[np.ndarray]] = None
+    if has_mask:
+        masks = []
+        for item in batch:
+            if item.mask_content is not None:
+                masks.append(item.mask_content)
+            else:
+                # Synthesise an all-ones mask at the image's pixel resolution.
+                content = item.content
+                content = content[0] if isinstance(content, list) else content
+                h, w = content.shape[:2]
+                masks.append(np.ones((h, w), dtype=np.float32))
+
+    return contents, controls, masks
 
 
-def encode_and_save_batch(ae, batch: List[ItemInfo]):
-    """Encode images through VAE and save cached latents."""
-    contents, controls = preprocess_images(batch)
+def encode_and_save_batch(ae, batch: List[ItemInfo], architecture: str, has_mask: bool = False):
+    """Encode images through VAE and save cached latents (and optional masks)."""
+    contents, controls, masks = preprocess_images(batch, has_mask=has_mask)
+    factor = LATENT_SPATIAL_FACTOR.get(architecture, 16)
 
     with torch.no_grad():
         latents = ae.encode(contents.to(ae.device, dtype=ae.dtype))  # B, C, H, W
@@ -73,15 +95,29 @@ def encode_and_save_batch(ae, batch: List[ItemInfo]):
         else:
             control_latents = None
 
+        mask_latents: Optional[list[torch.Tensor]] = None
+        if masks is not None:
+            # Stack (B, 1, H, W), avg-pool to latent spatial resolution. unbind(0) yields
+            # one (1, h, w) mask per item — the shape save_latent_cache expects.
+            mask_stack = torch.from_numpy(np.stack(masks)).unsqueeze(1)  # B, 1, H, W
+            mask_latents = list(
+                torch.nn.functional.avg_pool2d(mask_stack, kernel_size=factor, stride=factor).unbind(0)
+            )
+
     for b, item in enumerate(batch):
         target_latent = latents[b]
         control_latent = control_latents[b] if control_latents is not None else None
+        mask_latent = mask_latents[b] if mask_latents is not None else None
         logger.info(f"Saving cache: {item.item_key} -> {item.latent_cache_path}, shape: {target_latent.shape}")
-        save_latent_cache(item, target_latent, control_latent)
+        save_latent_cache(item, target_latent, control_latent, mask_latent)
 
 
 def encode_datasets(datasets, encode_fn, args):
-    """Iterate through datasets, encode images, save caches."""
+    """Iterate through datasets, encode images, save caches.
+
+    ``encode_fn`` is called as ``encode_fn(batch_slice, dataset)`` so the callback
+    can pick up ``dataset.architecture`` and ``dataset.has_mask`` itself.
+    """
     num_workers = args.num_workers if args.num_workers is not None else max(1, os.cpu_count() - 1)
     for i, dataset in enumerate(datasets):
         logger.info(f"Encoding dataset [{i}]")
@@ -111,7 +147,7 @@ def encode_datasets(datasets, encode_fn, args):
 
             bs = args.batch_size if args.batch_size is not None else len(batch)
             for j in range(0, len(batch), bs):
-                encode_fn(batch[j : j + bs])
+                encode_fn(batch[j : j + bs], dataset)
 
         # Remove stale cache files
         all_cache_paths = set(os.path.normpath(p) for p in all_cache_paths)
@@ -160,8 +196,8 @@ def main():
     ae = load_vae(args.vae, dtype=vae_dtype, device=device, disable_mmap=True)
     ae.to(device)
 
-    def encode(batch: List[ItemInfo]):
-        encode_and_save_batch(ae, batch)
+    def encode(batch: List[ItemInfo], dataset):
+        encode_and_save_batch(ae, batch, dataset.architecture, has_mask=getattr(dataset, "has_mask", False))
 
     encode_datasets(datasets, encode, args)
 

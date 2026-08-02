@@ -69,6 +69,7 @@ class ImageDatasetParams(BaseDatasetParams):
 
     image_directory: Optional[str] = None
     control_directory: Optional[str] = None
+    mask_directory: Optional[str] = None
 
 
 @dataclass
@@ -127,6 +128,7 @@ class ConfigSanitizer:
         "image_directory": str,
         "cache_directory": str,
         "control_directory": str,
+        "mask_directory": str,
     }
 
     # Options that come from argparse only (not from user config)
@@ -303,6 +305,7 @@ def generate_dataset_group_by_blueprint(
                 f"""\
         image_directory: "{dataset.image_directory}"
         control_directory: "{dataset.control_directory}"
+        mask_directory: "{dataset.mask_directory}"
     \n"""
             ),
             "    ",
