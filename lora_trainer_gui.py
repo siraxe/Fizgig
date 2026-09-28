@@ -73,6 +73,12 @@ COLORS = {
     "accent_hover": "#60A5FA",   # Accent hover
     "accent_subtle": "#1E3A5F",  # Accent backgrounds
 
+    # Training-queue button (status bar, lower right). Deliberately a LIGHT blue: on a dark
+    # bar a pale block reads as a distinct control, where another dark-surface panel just
+    # blends into the furniture. Text on it is bg_deep (8.6:1) — text_primary would vanish.
+    "queue_blue": "#93C5FD",
+    "queue_blue_hover": "#BFDBFE",
+
     "border": "#3A4555",         # Borders, dividers
     "border_focus": "#3B82F6",   # Focus rings
 
@@ -359,6 +365,46 @@ ARCHITECTURES = {
         "sample_height_default": 1024,
         "lora_name_suffix": "krea2",
     },
+    "MiniMax H3 (experimental)": {
+        # MiniMax H3 trains natively via fizgig.scripts.minimax_* (single-process). The command
+        # builders branch on "is_minimax". Barebones IMAGE-ONLY: no samples, no preview, no
+        # per-image loss watch, no LoKR — the most minimal training surface. The Klein-shaped keys
+        # below are kept so start_training / Samples / validate_inputs read the same shape.
+        "train_script": "src/fizgig/scripts/minimax_train.py",
+        "cache_latents_script": "src/fizgig/scripts/minimax_cache_latents.py",
+        "cache_text_script": "src/fizgig/scripts/minimax_cache_text.py",
+        "is_minimax": True,
+        "network_module": "fizgig.networks.lora_klein",  # unused — minimax trainer builds its own net
+        "use_fizgig_venv": True,
+        "timestep_sampling": "shift",
+        "discrete_flow_shift": 12.0,   # H3 video sigma-shift (fixed; the Timestep section is hidden)
+        "weighting_scheme": "none",
+        "blocks_swap_max": 40,         # bnb NF4 blocks swap packed (uint8) — planner caps at 40 of 50
+        "fp8_text_encoder_flag": None,
+        "uses_clip": False,
+        "uses_t5": False,
+        "uses_text_encoder": True,
+        "uses_model_type": False,
+        "uses_model_version": False,
+        "model_version": "minimax-h3",
+        "vae_label": "MiniMax H3 Video VAE",
+        "text_encoder_label": "Qwen3-VL-32B",
+        "is_distilled": False,
+        "supports_weighting_scheme": False,
+        "supports_discrete_flow_shift": False,
+        # In-training previews render one still per prompt on the resident training DiT
+        # (latent_t=1, the training distribution). Per-epoch only, like Krea 2.
+        "supports_samples": True,
+        "sample_cfg_default": 1.0,
+        "sample_flow_shift_default": None,
+        "sample_steps_default": 20,   # the reference pipeline default
+        # H3's native canvas is a 768 SHORT EDGE with a 768*1344 pixel cap. 1024x1024 is
+        # both over that cap and off the canvas convention; the reference pipeline samples
+        # 768x768 and ComfyUI's node defaults to 1344x768 (also 768 short edge).
+        "sample_width_default": 768,
+        "sample_height_default": 768,
+        "lora_name_suffix": "mmh3",
+    },
 }
 
 ARCHITECTURE_LIST = list(ARCHITECTURES.keys())
@@ -384,6 +430,154 @@ PRESETS_DIR = os.path.join(os.path.dirname(__file__), "presets")
 
 # Snapshot of settings from the most recent training launch — restorable via "Load Last Train" button
 LAST_TRAIN_FILE = os.path.join(PRESETS_DIR, ".last_train_settings.json")
+# Training queue: full settings snapshots waiting to run back-to-back. Survives restart;
+# never auto-starts on launch (a queue found at startup waits for the user's first Start).
+QUEUE_FILE = os.path.join(PRESETS_DIR, "training_queue.json")
+
+# MiniMax H3 — how much of training happens at LOW NOISE ("Low-noise training" on the tab).
+#
+# The dial is the SHARE, not a shift number. Same underlying knob, stated as the thing that
+# actually matters. Training draws u uniform and maps it through
+#
+#     sigma = shift * u / (1 + (shift - 1) * u)
+#
+# so the fraction of steps landing below a threshold T is P = T / (shift*(1 - T) + T). At
+# T = 0.5 that inverts to exactly
+#
+#     shift = (1 - P) / P
+#
+# — no solver, no table, no resolution term. Reference points: 50% -> shift 1 (unshifted
+# uniform), 22% -> 3.5, 7.7% -> 12 (H3's own video default).
+#
+# DELIBERATELY UNCAPPED and deliberately independent of megapixels. The previous MP-keyed
+# version derived its numbers from a sqrt-token transfer rule that has never been validated on
+# H3, and capping the list to that rule's answers ruled out settings worth trying.
+MINIMAX_LOWNOISE_SIGMA = 0.5     # "low noise" = the cleaner half of the sigma range
+
+
+def minimax_lownoise_to_shift(pct):
+    """Share of steps below sigma 0.5 (percent) -> the shift that produces it. None if unusable.
+
+    0 and 100 are the asymptotes, not values: 0% needs an infinite shift and 100% a shift of 0,
+    and neither is a schedule. Everything strictly between them is allowed."""
+    try:
+        p = float(str(pct).strip().rstrip("%")) / 100.0
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 < p < 1.0):
+        return None
+    return (1.0 - p) / p
+
+
+def minimax_lownoise_to_lognorm_shift(pct):
+    """Share of steps below sigma 0.5 (percent) -> the shift for a LOGIT-NORMAL base.
+
+    The box means the same thing whichever shape is chosen; only the arithmetic behind it
+    changes. For a uniform base the inverse is closed-form. For a logit-normal base,
+    sigma < 0.5 happens when the base draw u < 1/(s+1), and u = sigmoid(z) with z ~ N(0,1), so
+
+        P = Phi(logit(1 / (s + 1)))
+
+    which is monotonically decreasing in s but has no tidy inverse — hence bisection. Bracketed
+    generously (1e-6 .. 1e6) so extreme box values still resolve rather than silently clamping.
+    """
+    import math as _m
+    p = None
+    try:
+        p = float(str(pct).strip().rstrip("%")) / 100.0
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 < p < 1.0):
+        return None
+
+    def _share(s):
+        u = 1.0 / (s + 1.0)                                   # the base draw that gives sigma 0.5
+        z = _m.log(u / (1.0 - u))                             # logit
+        return 0.5 * (1.0 + _m.erf(z / _m.sqrt(2.0)))         # Phi(z)
+
+    lo, hi = 1e-6, 1e6
+    if p >= _share(lo):
+        return lo
+    if p <= _share(hi):
+        return hi
+    for _ in range(200):                                      # ~1e-60 on the bracket; cheap
+        mid = _m.sqrt(lo * hi)                                # geometric: s spans many decades
+        if _share(mid) > p:
+            lo = mid
+        else:
+            hi = mid
+    return _m.sqrt(lo * hi)
+
+
+def minimax_shift_to_lownoise(shift):
+    """The inverse — shows an existing shift (e.g. from an older preset) as a percentage."""
+    try:
+        s = float(shift)
+    except (TypeError, ValueError):
+        return None
+    return None if s <= 0 else 100.0 / (1.0 + s)
+
+
+# MiniMax H3 — which of the 50 DiT blocks to train ("Blocks to Train" on the Training tab).
+#
+# THIS IS A SEARCH, not a recommendation, and the labels say so. H3 is 50 identical blocks with
+# no published map. The ranges come from the proportions of Klein's empirically-built map
+# (composition in the first ~30% of depth, identity ~30-75%, fine detail ~60-100%) scaled to 50
+# blocks — an analogy between two architectures, not a measurement of this one.
+#
+# READ EVERY RESULT AS: "was this subset sufficient?" A range that trains a good likeness means
+# its COMPLEMENT was not needed — whichever end that turns out to be. There is no option here
+# that disproves the idea; a surprising winner just relocates the answer. (An earlier revision
+# labelled the front half a "control, expected worse". That was wrong: a good front-half result
+# would mean the back half is droppable, which is the outcome we are hunting, not a refutation.)
+#
+# Why dropping blocks may HELP rather than merely cost less: a block that carries no identity
+# still receives gradient, and what is left for it to learn is the dataset's background, framing
+# and lighting. Excluding it removes capacity that would otherwise go into memorising the set.
+#
+# What is measured: per-block ||dW|| on two finished H3 LoRAs is nearly FLAT (3x quietest to
+# loudest against a 2% flat expectation, thirds within 28/34/38), and the quietest blocks do not
+# agree between runs. Weight movement offers no map either way — which is why the only way to
+# learn anything here is to train a range and compare.
+# The box is EDITABLE: these are jumping-off points, and anything the trainer's parser accepts
+# can be typed instead — "3-12, 14-15, 22, 31-33". The label separator is "·" and not "-" or a
+# plain space, because both of those appear inside a block spec; splitting on them would turn
+# "3-12, 14" into "3-12," and train the wrong set without ever complaining.
+MINIMAX_BLOCK_OPTIONS = [
+    "all · every block (50 of 50)",
+    "10-49 · skip the first 10",
+    "14-37 · middle band",
+    "25-49 · back half",
+    "0-24 · front half",
+]
+
+
+MINIMAX_NUM_BLOCKS = 50          # H3's DiT block count (MiniMaxH3Config.num_layers)
+
+# Base Precision — the label the user sees, and the --base_quant value it sends. Auto plans the
+# quantisation and the block-swap count together (see plan_base_quant in minimax/trainer.py);
+# an explicit pick is never overridden, the swap plan is built around it instead.
+MINIMAX_BASE_QUANT_OPTIONS = [
+    "Auto (recommended)",
+    "int8 · most accurate, needs ~30 GB free",
+    "4-bit · fits smaller cards",
+]
+
+
+def minimax_base_quant(raw):
+    """Dropdown label -> the --base_quant value. Anything unrecognised falls back to auto."""
+    s = str(raw or "").split("·")[0].strip().lower()
+    if s.startswith("int8"):
+        return "int8"
+    if s.startswith("4-bit") or s.startswith("nf4"):
+        return "nf4"
+    return "auto"
+
+
+def minimax_block_spec(raw):
+    """The block selection out of a dropdown label OR a hand-typed spec. "" -> "all"."""
+    return str(raw or "").split("·")[0].strip() or "all"
+
 
 # Built-in presets — always available in the Load Preset dropdown, prefixed with ✨ to distinguish
 # from user-saved presets. Defined in code so they ship with the app and can't be deleted accidentally.
@@ -527,6 +721,92 @@ SEED_TRAVEL_PRESETS = {
     "Feedback dream": dict(ref_strength="0.25", ref_mp="1.0", sequential=True,  waypoints="4"),
     # No reference at all — pure noise wandering through many seeds.
     "Free ride":      dict(ref_strength="0.0",  ref_mp="1.0", sequential=False, waypoints="8"),
+}
+
+# MiniMax H3 built-in presets — barebones image-only LoRA. Only the knobs the H3 trainer reads
+# apply (rank/alpha/lr/epochs/save/seed/adaptive/optimizer/grad-accum/max-grad-norm/megapixels);
+# the H3 base is always NF4 (no swap / fp8 / quant knobs). The first entry is applied on switch.
+MINIMAX_BUILT_IN_PRESETS = {
+    # LoKR factor 8 rather than standard LoRA: the same call Krea 2 landed on after measurement
+    # (highest likeness recorded here, no skin sheen). Dim/alpha still ride along for when the
+    # Network Type is flipped back to LoRA — the H3 trainer ignores them under LoKR.
+    #
+    # Static 1e-4, adaptive OFF. The adaptive watcher probes the LR UP on steady descent, and a
+    # density sweep needs the LR held still or the runs aren't comparable.
+    #
+    # 0.5 MP rather than the 0.25 the other families default to: detail has to be present in the
+    # training image before any schedule can teach it, and 0.5 still fits without block swap.
+    #
+    # 60% low-noise WITH mid-concentrated. The two controls answer different questions: the box
+    # is how much training sits below sigma 0.5, the checkbox is where that mass actually lands.
+    # At 60% the split is 58.8% of steps in sigma 0.3-0.7, 12.9% below 0.2, 5.0% above 0.8
+    # (measured, 2M draws through sample_sigmas). The same 60% on a UNIFORM base would dump far
+    # more into the near-clean end, where the latent is almost the finished image and the step
+    # teaches little. Peter ran 70% + mid-concentrated well; 60 keeps slightly more mid-band and
+    # gives back some sigma>0.8 mass, which is the only part of the schedule that lets the LoRA
+    # touch composition at all. Both beat the 22% this shipped with.
+    #
+    # Note the mid-band fraction peaks around 50% and is nearly flat from 45-60, so it does NOT
+    # discriminate on its own — it is a description of where the steps go, not a prediction of
+    # likeness. 60 is Peter's call from real runs, with the arithmetic agreeing rather than
+    # leading. 50% is worth trying: its shift is exactly 1.00, i.e. the plain logit-normal that
+    # earlier runs recorded as overdriving adapters — on adamw8bit, before the optimizer was
+    # understood.
+    "✨ MiniMax H3 Defaults (LoKR 8, 0.5 MP)": {
+        "NETWORK_DIM": 16, "NETWORK_ALPHA": 16,
+        "NETWORK_TYPE": "LoKR (Kronecker)", "LOKR_FACTOR": 8,
+        "LEARNING_RATE": 1e-4,
+        "MAX_TRAIN_EPOCHS": 60, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
+        "ADAPTIVE_LR": False, "ADAPTIVE_LR_MIN": "1e-5", "ADAPTIVE_LR_MAX": "4e-4",
+        # adamw, NOT adamw8bit — the single biggest likeness change measured on H3 (2026-08-06).
+        # Every other knob had been swept with likeness stuck around 40-50%; full-precision
+        # optimizer state moved it night-and-day on the same dataset. The 8-bit optimizer stores
+        # the second moment blockwise-quantized, and on this model that is evidently costing the
+        # fine detail. Costs ~1.2 GB of fp32 state against a 21 GB resident base.
+        "OPTIMIZER_TYPE": "adamw",
+        "GRADIENT_ACCUMULATION": 1, "MAX_GRAD_NORM": 1.0,
+        "DATASET_MEGAPIXELS": "0.5",
+        "MINIMAX_LOWNOISE_PCT": "60", "MINIMAX_LOGNORM": True,
+        # The experiment knobs all ship OFF, so the preset is the plain baseline every A/B is
+        # measured against. Each of these was built to be TRIED, not to be on by default:
+        #   blocks "all"      — no block-range restriction
+        #   AdaLN False       — Peter's call from real runs; the reference trains it, we do not
+        #   slow blocks ""    — one LR everywhere, no depth split
+        #   distill False     — ordinary photo training, no r2v teacher (which also needs the
+        #                       _teref cache built, so defaulting it on would break a fresh run)
+        "MINIMAX_BLOCKS": "all", "MINIMAX_BASE_QUANT": MINIMAX_BASE_QUANT_OPTIONS[0],
+        "MINIMAX_TRAIN_ADALN": False,
+        "MINIMAX_SLOW_BLOCKS": "", "MINIMAX_SLOW_LR_SCALE": "0.2",
+        "MINIMAX_DISTILL": False,
+    },
+    # Same run, fewer epochs, LR let off the leash. Adaptive LR IGNORES the Learning Rate box
+    # entirely — the run starts at the GEOMETRIC MIDPOINT of Min/Max, so 2e-4 and 4e-4 start it
+    # at 2.83e-4, nearly 3x the Defaults preset's static 1e-4, and the watcher owns it from
+    # there. That is where the time comes from: 30 epochs instead of 50, at a much higher LR.
+    # LEARNING_RATE is still carried so the box holds something sensible if adaptive is unticked.
+    #
+    # The 2e-4 floor is the same call the Klein Identity presets make, and it is a floor, not a
+    # target: the watcher halves the LR on plateau or instability but never below it, so the run
+    # cannot crawl to a stop the way a 1e-5 floor allows on a long run. Note the dropdown labels
+    # it "2e-4 - rank 4/8 only" — that warning is about LoRA RANK, and this preset trains LoKR,
+    # where dim/alpha do not apply at all. The caveat does not translate; treat this as the fast
+    # option to reach for when you want a result today, and the Defaults preset as the one to
+    # judge a dataset or an A/B on.
+    "✨ MiniMax H3 Fast (LoKR 8, adaptive LR)": {
+        "NETWORK_DIM": 16, "NETWORK_ALPHA": 16,
+        "NETWORK_TYPE": "LoKR (Kronecker)", "LOKR_FACTOR": 8,
+        "LEARNING_RATE": 1e-4,
+        "MAX_TRAIN_EPOCHS": 30, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
+        "ADAPTIVE_LR": True, "ADAPTIVE_LR_MIN": "2e-4", "ADAPTIVE_LR_MAX": "4e-4",
+        "OPTIMIZER_TYPE": "adamw",
+        "GRADIENT_ACCUMULATION": 1, "MAX_GRAD_NORM": 1.0,
+        "DATASET_MEGAPIXELS": "0.5",
+        "MINIMAX_LOWNOISE_PCT": "60", "MINIMAX_LOGNORM": True,
+        "MINIMAX_BLOCKS": "all", "MINIMAX_BASE_QUANT": MINIMAX_BASE_QUANT_OPTIONS[0],
+        "MINIMAX_TRAIN_ADALN": False,
+        "MINIMAX_SLOW_BLOCKS": "", "MINIMAX_SLOW_LR_SCALE": "0.2",
+        "MINIMAX_DISTILL": False,
+    },
 }
 
 # Directory for dataset configurations
@@ -691,6 +971,15 @@ DEFAULT_PREFS = {
     # model, so samples can render on the resident training DiT instead of loading the
     # separate Turbo checkpoint (saves the park-to-CPU shuffle during previews).
     "krea2_turbo_lora": "",
+    # MiniMax H3 model paths (experimental third family — barebones image-only LoRA training).
+    # bf16 DiT is the training base (NF4-quantized at load); Qwen3-VL-32B TE + video VAE cache.
+    "minimax_dit": "",
+    # ref2va is a DIFFERENT fine-tune from fl2va, not another quantization of it: it is what
+    # ComfyUI's r2v workflow loads, and the only H3 build that accepts reference images.
+    # Optional — required only for reference distillation.
+    "minimax_ref_dit": "",
+    "minimax_text_encoder": "",
+    "minimax_vae": "",
     # Output directories — relative to repo root, portable across clones/moves.
     # Resolved to absolute in load_prefs(); in-memory pref values are absolute.
     # All three live as top-level folders inside the repo:
@@ -827,6 +1116,85 @@ def _app_commit() -> str:
         return r.stdout.strip() if r.returncode == 0 else ""
     except Exception:
         return ""
+
+
+def _git(*args, timeout=8) -> str:
+    """Run a git command in the repo, return stripped stdout or "" on any failure."""
+    try:
+        import subprocess as _sp
+        r = _sp.run(["git", "-C", FIZGIG_DIR, *args],
+                    capture_output=True, text=True, timeout=timeout,
+                    creationflags=(0x08000000 if os.name == "nt" else 0))
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _git_describe_version() -> str:
+    """Human version of the running checkout: 'v3.1.1' exactly on a tag,
+    'v3.1.1-2-gee3a7fa' in between, or the bare short SHA if tags aren't local."""
+    return _git("describe", "--tags", "--always") or _app_commit()
+
+
+def _latest_release_tag():
+    """Highest vX.Y.Z release tag on origin as (tag, sha), or None when unreachable.
+
+    ls-remote is a single read-only round-trip — no fetch, no GitHub API, no tokens or
+    rate limits. Returning None (offline, no origin, ZIP download) means 'unknown':
+    the caller shows nothing rather than a false nag."""
+    out = _git("ls-remote", "--tags", "--refs", "origin", "v*", timeout=15)
+    if not out:
+        return None
+    best, best_key = None, None
+    for line in out.splitlines():
+        try:
+            sha, ref = line.split(None, 1)
+            tag = ref.strip().rsplit("/", 1)[-1]
+            key = tuple(int(p) for p in tag.lstrip("v").split("."))
+        except (ValueError, IndexError):
+            continue    # not a plain vX.Y.Z tag — ignore
+        if best_key is None or key > best_key:
+            best, best_key = (tag, sha), key
+    return best
+
+
+def _update_status_from(latest, has_obj: bool, is_ancestor: bool) -> str:
+    """Pure decision: 'up_to_date' | 'update_available' | 'unknown'.
+
+    Up to date means HEAD CONTAINS the latest release tag's commit — true both exactly on
+    the tag and ahead of it (a user who pulled newer master must not be nagged). A tag whose
+    commit we don't even have locally, or have but isn't an ancestor, means the release is
+    newer than this checkout."""
+    if latest is None:
+        return "unknown"
+    if has_obj and is_ancestor:
+        return "up_to_date"
+    return "update_available"
+
+
+def _git_ok(*args, timeout=8) -> bool:
+    """Run git for its EXIT CODE (merge-base --is-ancestor answers that way)."""
+    try:
+        import subprocess as _sp
+        r = _sp.run(["git", "-C", FIZGIG_DIR, *args],
+                    capture_output=True, text=True, timeout=timeout,
+                    creationflags=(0x08000000 if os.name == "nt" else 0))
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _check_for_update():
+    """Full check (network + local git). Returns ('update_available', tag) /
+    ('up_to_date', current) / ('unknown', '')."""
+    latest = _latest_release_tag()
+    if latest is None:
+        return "unknown", ""
+    tag, sha = latest
+    has_obj = _git_ok("cat-file", "-e", f"{sha}^{{commit}}")
+    is_anc = has_obj and _git_ok("merge-base", "--is-ancestor", sha, "HEAD")
+    status = _update_status_from(latest, has_obj, is_anc)
+    return status, (tag if status == "update_available" else _git_describe_version())
 
 
 def _pod_stop_key_env() -> str:
@@ -972,7 +1340,8 @@ class LoRATrainerGUI:
         # Always empty since the Output Folder UI was removed — prep always writes into the
         # training folder. Kept because the convert pipeline reads it ("or source_folder").
         self.convert_output_var = tk.StringVar()
-        self.max_size_var = tk.StringVar(value="1024")
+        # Image Prep's size target is a MEGAPIXEL AREA, not a longest edge — declared with the
+        # dataset vars below (it seeds from the Training tab's Target Megapixels).
         # Default flipped to KEEP (False) 2026-07-28 — safe-by-default like the Look Filter and
         # the Captions Remove button; remembered across restarts now that it's a real choice.
         self.delete_originals_var = tk.BooleanVar(
@@ -996,6 +1365,15 @@ class LoRATrainerGUI:
         self.dataset_caption_ext_var = tk.StringVar(value=".txt")
         self.dataset_jsonl_file_var = tk.StringVar()
         self.dataset_megapixels_var = tk.StringVar(value="0.25")
+        # Image Prep's target area. Training buckets by AREA and never upscales, so prepping to a
+        # longest-edge cap silently pushed every non-square image below the training target and
+        # threw away detail training could not get back (issue #44). Defaults to 1.0 MP — NOT the
+        # Training tab's 0.25 default: prepping above the training target is free (training just
+        # downscales at cache time), so the default keeps resolution in hand for training at any
+        # target up to 1.0 MP. The inline warning covers the one harmful direction (prep < train).
+        # Remembered across restarts.
+        self.prep_megapixels_var = tk.StringVar(
+            value=str(self.last_used.get("prep_megapixels", "1.0")))
         self.dataset_batch_size_var = tk.StringVar(value="1")
         self.dataset_num_repeats_var = tk.StringVar(value="1")
         self.dataset_enable_bucket_var = tk.BooleanVar(value=True)
@@ -1025,6 +1403,12 @@ class LoRATrainerGUI:
         self.caption_text_var.trace_add("write", self._save_last_used_paths)
         self.prep_mode_var.trace_add("write", self._save_last_used_paths)
         self.delete_originals_var.trace_add("write", self._save_last_used_paths)
+        self.prep_megapixels_var.trace_add("write", self._save_last_used_paths)
+        # Prep's target area and the Training tab's target are independent, but prepping BELOW
+        # the training target is the one harmful direction — refresh the summary (which carries
+        # that warning) whenever either side moves.
+        self.prep_megapixels_var.trace_add("write", self._update_prep_note)
+        self.dataset_megapixels_var.trace_add("write", self._update_prep_note)
         # The Image Prep summary shows a live image count + resolution check for the folder,
         # so a folder change on the Start tab must refresh it. Guarded: fires before the
         # Image Prep tab exists during startup, and _update_prep_note no-ops then.
@@ -1067,6 +1451,26 @@ class LoRATrainerGUI:
             "SAVE_EVERY_N_EPOCHS": 1,
             "SEED": 42,
             "BLOCKS_SWAP": "auto",  # Klein valid range 0-16; "auto" detects from GPU
+            # MiniMax H3 only. Percent of steps trained below sigma 0.5 (H3's own default works out at ~7.7%).
+            # 60 + mid-concentrated matches the MiniMax preset, which is what a switch to that
+            # family applies anyway; these are the values the widgets are BUILT with, so they are
+            # what shows before any preset lands. Both keys are MiniMax-only — no other family
+            # reads them. (OPTIMIZER_TYPE below is deliberately NOT changed to match the preset:
+            # it is shared with Klein and Krea 2, and the MiniMax preset supplies adamw on switch.)
+            "MINIMAX_LOWNOISE_PCT": "60",
+            "MINIMAX_LOGNORM": True,       # False = flat spread; True = mid-concentrated
+            "MINIMAX_BLOCKS": "all",
+            "MINIMAX_BASE_QUANT": MINIMAX_BASE_QUANT_OPTIONS[0],
+            # OFF by default (Peter's call from real runs). The reference trains AdaLN on the
+            # pruned checkpoint, but AdaLN is a pure function of the timestep — adaln_proj(t_emb)
+            # and nothing else — so its adapters cannot tell one subject from another, and on the
+            # pruned build they were taking ~45% of all weight movement to do it.
+            "MINIMAX_TRAIN_ADALN": False,
+            "MINIMAX_DISTILL": False,      # off = ordinary training
+            "MINIMAX_DISTILL_WEIGHT": "0.8",
+            "MINIMAX_DISTILL_REFS": "2",
+            "MINIMAX_SLOW_BLOCKS": "",     # blank = one LR everywhere
+            "MINIMAX_SLOW_LR_SCALE": "0.2",
             "RESUME_TRAINING": "",
             "OPTIMIZER_TYPE": "adamw8bit",
             "OPTIMIZER_ARGS": "",
@@ -1145,6 +1549,14 @@ class LoRATrainerGUI:
         # Override with last-used LoRA output directory if available
         if self.last_used.get("lora_output_dir"):
             self.settings["LORA_OUTPUT_DIR"] = self.last_used["lora_output_dir"]
+
+        # Training queue — loaded before any UI so the status-bar button can show its count.
+        # A queue restored from a previous session waits for the user; it never auto-starts.
+        self.training_queue = self._load_training_queue()
+
+        # Startup update check: which newer tag (if any) is available. Populated on a daemon
+        # thread a couple of seconds after launch (see the after() call at the end of __init__).
+        self._update_info = None
 
         # Klein's trainer resolves these itself (name-or-module-path). Krea 2 goes through
         # fizgig.training.optimizers, which offers a different set — filtered to what's actually
@@ -1288,8 +1700,22 @@ class LoRATrainerGUI:
         self.image_folder_var.trace_add("write", self._on_caption_folder_changed)
 
         # Prevent mousewheel from accidentally changing Combobox/Spinbox values
-        self.master.bind_class("TCombobox", "<MouseWheel>", lambda e: "break")
-        self.master.bind_class("TSpinbox", "<MouseWheel>", lambda e: "break")
+        # ONE global wheel router instead of per-panel bind_all tug-of-wars (which broke in
+        # both directions: an open tool window stole the main window's wheel, and a stray
+        # <Leave> killed the tool window's). The router sends the wheel wherever the POINTER
+        # is: a Text (console) or Listbox scrolls itself natively; otherwise the nearest
+        # scrollable Canvas up the ancestry scrolls — an inner panel when hovered, the tab's
+        # main scrollbar everywhere else. Button-4/5 are the X11 wheel (pods).
+        for _seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.master.bind_all(_seq, self._route_mousewheel)
+            # Dropdowns/spinboxes must NEVER change value on wheel (an accidental flick over
+            # the LR box mid-scroll is how a run gets silently mis-configured) — but they
+            # must not be dead zones either: route the scroll to the page, then break so
+            # the widget's own value-spin binding never runs. The old bare-"break" bindings
+            # covered <MouseWheel> only, leaving X11 pods spinning values via Button-4/5.
+            self.master.bind_class("TCombobox", _seq, self._wheel_over_dropdown)
+            self.master.bind_class("TSpinbox", _seq, self._wheel_over_dropdown)
+            self.master.bind_class("Spinbox", _seq, self._wheel_over_dropdown)
 
         # Start status indicator polling
         self._update_status_indicator()
@@ -1338,6 +1764,53 @@ class LoRATrainerGUI:
             '_royale_lora_running', '_royale_exporting', '_royale_scoring',
             '_royale_cmp_running'))
 
+    @staticmethod
+    def _wheel_units(event):
+        """Scroll units from either wheel encoding: Windows <MouseWheel> delta (±120 per
+        notch, high-res mice send smaller values) or X11 Button-4/5 (pods)."""
+        num = getattr(event, "num", 0)
+        if num == 4:
+            return -3
+        if num == 5:
+            return 3
+        d = getattr(event, "delta", 0)
+        if not d:
+            return 0
+        return int(-1 * (d / 120)) if abs(d) >= 120 else (-1 if d > 0 else 1)
+
+    def _route_mousewheel(self, event):
+        """Global wheel dispatch — see the install site for the routing rules."""
+        try:
+            w = self.master.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            w = None
+        if w is None:
+            return
+        units = self._wheel_units(event)
+        if not units:
+            return
+        node, hops = w, 0
+        while node is not None and hops < 40:
+            # Native scrollers own the wheel while hovered — their class bindings already
+            # scroll them, and routing the page underneath as well would double-scroll.
+            if isinstance(node, (tk.Text, tk.Listbox, ttk.Treeview)):
+                return
+            if isinstance(node, tk.Canvas):
+                try:
+                    if node.cget("yscrollcommand"):
+                        node.yview_scroll(units, "units")
+                        return "break"
+                except tk.TclError:
+                    pass
+            node = getattr(node, "master", None)
+            hops += 1
+        return
+
+    def _wheel_over_dropdown(self, event):
+        """Wheel over a Combobox/Spinbox: scroll the page, never the value."""
+        self._route_mousewheel(event)
+        return "break"
+
     def _is_render_busy(self):
         """In-process GPU render on a tab that unloads its engine on switch (Repair
         Studio / Explorer / Royale). Switching tabs here would reset a busy engine and
@@ -1359,6 +1832,8 @@ class LoRATrainerGUI:
             return True
         if getattr(self, '_translating', False):
             return True
+        if getattr(self, '_fetch_running', False):
+            return True   # model download in flight — a queued run must not read partial files
         if getattr(self, '_repair_preview_in_flight', False):
             return True
         if getattr(self, '_explorer_generating', False):
@@ -1605,6 +2080,7 @@ class LoRATrainerGUI:
         data.update({
             "prep_mode": self.prep_mode_var.get(),
             "prep_replace_originals": bool(self.delete_originals_var.get()),
+            "prep_megapixels": self.prep_megapixels_var.get(),
             "image_folder": self.image_folder_var.get(),
             "caption_trigger": self.caption_text_var.get(),
             "dataset_cache_dir": self.dataset_cache_dir_var.get(),
@@ -1746,9 +2222,28 @@ class LoRATrainerGUI:
                                      highlightthickness=0)
         self._ram_canvas.pack(side=tk.TOP)
 
+        # --- far right: training-queue button (lower-right corner of the app) ---
+        # Packed BEFORE the override panel so it owns the corner; the override panel's
+        # expand soaks up whatever is left in the middle.
+        # fill=Y on both this column and the override panel below is what makes the two
+        # blocks exactly the same height (the bar is a fixed 82 px with pack_propagate off,
+        # so each ends up 82 - 2*pady). Without it each block sizes to its own content and
+        # the button sat visibly shorter than the panel beside it.
+        qcol = tk.Frame(bar, bg=COLORS["bg_deep"])
+        qcol.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 14), pady=10)
+        self._queue_btn = tk.Button(
+            qcol, text="📋 Queue", font=(FONT_FAMILY, 9, "bold"),
+            bg=COLORS["queue_blue"], fg=COLORS["bg_deep"],
+            activebackground=COLORS["queue_blue_hover"], activeforeground=COLORS["bg_deep"],
+            relief="flat", bd=0, padx=12, cursor="hand2",
+            command=self._open_queue_window)
+        self._queue_btn.pack(fill=tk.BOTH, expand=True)
+        self._refresh_queue_button()
+
         # --- right: live sample override (surface-coloured mini panel) ---
+        # Widths trimmed vs the original layout to make room for the queue button.
         ov = tk.Frame(bar, bg=COLORS["bg_surface"])
-        ov.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 14), pady=10, ipadx=8, ipady=4)
+        ov.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10), pady=10, ipadx=8, ipady=4)
         _sbg = COLORS["bg_surface"]
         r1 = tk.Frame(ov, bg=_sbg); r1.pack(fill=tk.X, padx=8, pady=(4, 0))
         self.sample_override_var = tk.BooleanVar(value=False)
@@ -1756,29 +2251,29 @@ class LoRATrainerGUI:
                         command=self._on_sample_override_changed,
                         style="Surface.TCheckbutton").pack(side=tk.LEFT)
         tk.Label(r1, text="seed", bg=_sbg, fg=COLORS["text_muted"],
-                 font=(FONT_FAMILY, 8)).pack(side=tk.LEFT, padx=(16, 3))
+                 font=(FONT_FAMILY, 8)).pack(side=tk.LEFT, padx=(10, 3))
         self.sample_override_seed_var = tk.StringVar(value="1234")
-        ttk.Entry(r1, textvariable=self.sample_override_seed_var, width=8).pack(side=tk.LEFT)
+        ttk.Entry(r1, textvariable=self.sample_override_seed_var, width=6).pack(side=tk.LEFT)
         # Same list as the Samples tab (SAMPLE_RESOLUTIONS) — these two had drifted, and
         # the override's lower ceiling silently downgraded a 1280/1536 preview.
         _res_vals = SAMPLE_RESOLUTIONS
         tk.Label(r1, text="W", bg=_sbg, fg=COLORS["text_muted"],
-                 font=(FONT_FAMILY, 8)).pack(side=tk.LEFT, padx=(14, 3))
+                 font=(FONT_FAMILY, 8)).pack(side=tk.LEFT, padx=(8, 3))
         self.sample_override_w_var = tk.StringVar(value="768")
         ttk.Combobox(r1, textvariable=self.sample_override_w_var, values=_res_vals,
-                     state="readonly", width=6).pack(side=tk.LEFT)
+                     state="readonly", width=5).pack(side=tk.LEFT)
         tk.Label(r1, text="H", bg=_sbg, fg=COLORS["text_muted"],
-                 font=(FONT_FAMILY, 8)).pack(side=tk.LEFT, padx=(12, 3))
+                 font=(FONT_FAMILY, 8)).pack(side=tk.LEFT, padx=(8, 3))
         self.sample_override_h_var = tk.StringVar(value="768")
         ttk.Combobox(r1, textvariable=self.sample_override_h_var, values=_res_vals,
-                     state="readonly", width=6).pack(side=tk.LEFT)
+                     state="readonly", width=5).pack(side=tk.LEFT)
         # Reference image — auto-capped to ~0.20 MP by the trainer so a big image can't OOM the
         # sample. Shown for BOTH families: Klein uses it as edit conditioning, Krea 2 routes it
         # through the Qwen3-VL vision path. (This comment used to claim it was hidden under
         # Krea 2 — it never was; there is no hide call for these widgets anywhere.)
         self._override_ref_caption = tk.Label(r1, text="Ref", bg=_sbg, fg=COLORS["text_muted"],
                  font=(FONT_FAMILY, 8))
-        self._override_ref_caption.pack(side=tk.LEFT, padx=(14, 3))
+        self._override_ref_caption.pack(side=tk.LEFT, padx=(8, 3))
         self.sample_override_ref_var = tk.StringVar(value="")
         # Compact button so it matches the seed/resolution input height (the
         # default ttk.Button padding is taller and pushes the prompt row down).
@@ -2286,18 +2781,9 @@ class LoRATrainerGUI:
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        # Enable mousewheel scrolling
-        def on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        def bind_mousewheel(event):
-            canvas.bind_all("<MouseWheel>", on_mousewheel)
-
-        def unbind_mousewheel(event):
-            canvas.unbind_all("<MouseWheel>")
-
-        scrollable_frame.bind("<Enter>", bind_mousewheel)
-        scrollable_frame.bind("<Leave>", unbind_mousewheel)
+        # Mousewheel: handled by the global router (_route_mousewheel) — it finds this
+        # canvas through the pointer's ancestry, so no per-tab bind_all is needed (the old
+        # Enter/Leave bind_all dance is what made scrollable areas fight each other).
 
         return scrollable_frame, canvas
 
@@ -2372,8 +2858,10 @@ class LoRATrainerGUI:
                 command=lambda: __import__("webbrowser").open(self._runpod_deploy_url()),
             )
             runpod.pack(side=tk.LEFT, padx=(12, 0))
+            # width sized for "⬆ Update Available" so the label can flip to it after the
+            # startup update check without shifting the whole button row.
             about = tk.Button(
-                row, text="About",
+                row, text="About", width=16,
                 font=(FONT_FAMILY, 12, "bold"),
                 fg="#FFFFFF", bg=COLORS["accent"],
                 activeforeground="#FFFFFF", activebackground=COLORS["accent_hover"],
@@ -2381,6 +2869,47 @@ class LoRATrainerGUI:
                 command=self._open_about_dialog,
             )
             about.pack(side=tk.LEFT, padx=(12, 0))
+            self._about_btn = about
+
+    # ------------------------------------------------------------
+    # Update check (startup + manual from the About dialog)
+    # ------------------------------------------------------------
+
+    def _start_update_check(self, on_done=None):
+        """Run the git-based release check on a daemon thread; marshal the result back to
+        the Tk thread. Silent by design: 'unknown' (offline, no origin) shows nothing —
+        never a false nag, never an error popup."""
+        def _worker():
+            status, info = _check_for_update()
+            self.master.after(0, lambda: self._apply_update_status(status, info, on_done))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_update_status(self, status, info, on_done=None):
+        if status == "update_available":
+            self._update_info = info                     # the newer tag, e.g. "v3.1.2"
+            btn = getattr(self, "_about_btn", None)
+            if btn is not None:
+                try:
+                    btn.config(text="⬆ Update Available",
+                               bg=COLORS["warning"], activebackground="#D97706",
+                               fg="#1E2530", activeforeground="#1E2530")
+                except Exception:
+                    pass
+        elif status == "up_to_date":
+            self._update_info = None
+            btn = getattr(self, "_about_btn", None)
+            if btn is not None:
+                try:
+                    btn.config(text="About", bg=COLORS["accent"],
+                               activebackground=COLORS["accent_hover"],
+                               fg="#FFFFFF", activeforeground="#FFFFFF")
+                except Exception:
+                    pass
+        if on_done:
+            try:
+                on_done(status, info)
+            except Exception:
+                pass
 
     def _open_about_dialog(self):
         """A small, personal About window: who made Fizgig, why, and a no-pressure
@@ -2418,7 +2947,50 @@ class LoRATrainerGUI:
         heading("Fizgig", 22)
         tk.Label(pad, text="Klein 9B & Krea 2 LoRA Studio — by Peter Neill",
                  font=(FONT_FAMILY, 11), fg=COLORS["text_explain"],
-                 bg=COLORS["bg_deep"]).pack(anchor=tk.W, pady=(0, 14))
+                 bg=COLORS["bg_deep"]).pack(anchor=tk.W, pady=(0, 4))
+        tk.Label(pad, text=f"Version {_git_describe_version() or 'unknown'}",
+                 font=(FONT_FAMILY, 9), fg=COLORS["text_muted"],
+                 bg=COLORS["bg_deep"]).pack(anchor=tk.W, pady=(0, 2))
+        # Always shown — how THIS install updates, whether or not one is pending right now.
+        _how = ("On RunPod, Fizgig updates itself every time you restart the pod — just stop "
+                "and start it to get the latest."
+                if _running_on_pod() else
+                "To update: close Fizgig and run update_fizgig.bat.")
+        tk.Label(pad, text=_how, font=(FONT_FAMILY, 9), fg=COLORS["text_muted"],
+                 bg=COLORS["bg_deep"], wraplength=WRAP, justify=tk.LEFT).pack(
+            anchor=tk.W, pady=(0, 10))
+
+        # Update banner — its own frame so the "Check for updates" button below can rebuild it
+        # live without reopening the dialog. Rendered per the current self._update_info.
+        update_box = tk.Frame(pad, bg=COLORS["bg_deep"])
+        update_box.pack(fill=tk.X, pady=(0, 8))
+
+        def _render_update_box():
+            for w in update_box.winfo_children():
+                w.destroy()
+            tag = getattr(self, "_update_info", None)
+            if not tag:
+                return
+            card = tk.Frame(update_box, bg=COLORS["accent_subtle"],
+                            highlightbackground=COLORS["warning"], highlightthickness=1)
+            card.pack(fill=tk.X)
+            tk.Label(card, text=f"⬆  Fizgig {tag} is available",
+                     font=(FONT_FAMILY, 11, "bold"), fg=COLORS["text_primary"],
+                     bg=COLORS["accent_subtle"]).pack(anchor=tk.W, padx=12, pady=(10, 0))
+            _upd = ("Restart the pod (stop and start it) to update."
+                    if _running_on_pod() else
+                    "Close Fizgig and run update_fizgig.bat to update.")
+            tk.Label(card, text=f"You're on {_git_describe_version() or 'an older build'}. {_upd}",
+                     font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=COLORS["accent_subtle"],
+                     wraplength=WRAP - 24, justify=tk.LEFT).pack(anchor=tk.W, padx=12, pady=(2, 8))
+            notes = tk.Label(card, text="📖  Read the release notes",
+                             font=(FONT_FAMILY, 10, "underline"), fg=COLORS["accent_hover"],
+                             bg=COLORS["accent_subtle"], cursor="hand2")
+            notes.pack(anchor=tk.W, padx=12, pady=(0, 10))
+            notes.bind("<Button-1>", lambda e: webbrowser.open(
+                "https://github.com/shootthesound/Fizgig/releases/latest"))
+
+        _render_update_box()
 
         para("By trade I'm a photographer and videographer — mostly live music, portraits, and a "
              "bit of teaching — and an AI tinkerer by night. I build a lot of open-source tooling "
@@ -2449,6 +3021,31 @@ class LoRATrainerGUI:
                   activeforeground=COLORS["text_primary"], activebackground=COLORS["border"],
                   relief="flat", bd=0, padx=18, pady=8, cursor="hand2",
                   command=win.destroy).pack(side=tk.LEFT)
+
+        check_btn = tk.Button(btn_row, text="Check for updates", font=(FONT_FAMILY, 11),
+                              fg=COLORS["text_primary"], bg=COLORS["bg_surface"],
+                              activeforeground=COLORS["text_primary"],
+                              activebackground=COLORS["border"],
+                              relief="flat", bd=0, padx=18, pady=8, cursor="hand2")
+        check_btn.pack(side=tk.LEFT, padx=(12, 0))
+
+        def _manual_check():
+            if not win.winfo_exists():
+                return
+            check_btn.config(text="Checking…", state=tk.DISABLED)
+
+            def _done(status, info):
+                if not win.winfo_exists():
+                    return
+                _render_update_box()
+                check_btn.config(
+                    state=tk.NORMAL,
+                    text=("Up to date ✓" if status == "up_to_date"
+                          else "Couldn't check" if status == "unknown"
+                          else "Check for updates"))
+            self._start_update_check(on_done=_done)
+
+        check_btn.config(command=_manual_check)
 
         win.update_idletasks()
         # Centre over the main window.
@@ -2849,7 +3446,23 @@ class LoRATrainerGUI:
             )
             arch_combo.pack(side=tk.LEFT)
             arch_combo.bind("<<ComboboxSelected>>", self._on_architecture_selected)
-            ToolTip(arch_combo, "Model family to train (Klein 9B or Krea 2)")
+            ToolTip(arch_combo, "Model family to train (Klein 9B, Krea 2 or MiniMax H3)")
+
+            # MiniMax renders its previews as a SINGLE video frame, which the H3 VAE decoder was
+            # not trained to produce — every workaround is a compromise (see vae.py). Previews
+            # are honest about relative progress but understate quality, so say so where the
+            # family is chosen rather than leaving people to mistrust their own run.
+            self._minimax_sample_note = tk.Label(
+                model_card,
+                text=("Note: MiniMax H3 in-training samples are single-frame renders and are "
+                      "known to look worse than the model's real output. Use them to track "
+                      "progress, but judge your epochs in ComfyUI."),
+                font=(FONT_FAMILY, 9), fg=COLORS["text_secondary"], bg=COLORS["bg_surface"],
+                wraplength=760, justify=tk.LEFT,
+            )
+            self._minimax_sample_note.pack(anchor=tk.W, pady=(10, 0))
+            if not self._is_minimax_arch():
+                self._minimax_sample_note.pack_forget()
 
         # === Presets card ===
         preset_card = self._start_section_card(
@@ -3179,6 +3792,222 @@ class LoRATrainerGUI:
                        "the scores with your dataset. Batch size 1.",
                   foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
         self._krea2_losswatch_hint.grid(row=24, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+        # --- Low-noise training share (MiniMax H3 only) -----------------------------------
+        # One number, uncapped: what fraction of steps train below sigma 0.5. Converted to the
+        # trainer's shift by minimax_lownoise_to_shift. Hidden for other families by
+        # _apply_training_arch_visibility.
+        self._minimax_shift_label = ttk.Label(training_content, text="Low-noise training:")
+        self._minimax_shift_label.grid(row=26, column=0, sticky=tk.W, padx=5, pady=(8, 2))
+        self._minimax_shift_frame = ttk.Frame(training_content)
+        self._minimax_shift_frame.grid(row=26, column=1, columnspan=2, sticky=tk.W, padx=5, pady=(8, 2))
+        self.entries["MINIMAX_LOWNOISE_PCT"] = ttk.Entry(self._minimax_shift_frame, width=8)
+        self.entries["MINIMAX_LOWNOISE_PCT"].insert(
+            0, str(self.settings.get("MINIMAX_LOWNOISE_PCT", "22")))
+        self.entries["MINIMAX_LOWNOISE_PCT"].pack(side=tk.LEFT)
+        ttk.Label(self._minimax_shift_frame, text="% of steps").pack(side=tk.LEFT, padx=(4, 0))
+        # Live readout: the number you type is the thing you care about, but the schedule it
+        # produces is worth seeing — especially at the extremes, where a couple of percent of
+        # change swings the shift enormously.
+        self._minimax_shift_match = tk.Label(self._minimax_shift_frame, text="",
+                                             font=(FONT_FAMILY, 9), bg=COLORS["bg_surface"])
+        self._minimax_shift_match.pack(side=tk.LEFT, padx=(10, 0))
+        self.minimax_lognorm_var = tk.BooleanVar(
+            value=bool(self.settings.get("MINIMAX_LOGNORM", False)))
+        ttk.Checkbutton(self._minimax_shift_frame, text="mid-concentrated",
+                        variable=self.minimax_lognorm_var,
+                        command=lambda: self._refresh_minimax_shift_match()).pack(side=tk.LEFT,
+                                                                                 padx=(10, 0))
+        self.entries["MINIMAX_LOWNOISE_PCT"].bind(
+            "<KeyRelease>", lambda _e: self._refresh_minimax_shift_match())
+        self._minimax_shift_hint = ttk.Label(
+            training_content,
+            text="How much of the run trains on nearly-clean images (noise below the halfway "
+                 "point) instead of heavily noised ones. Low noise is where fine detail and "
+                 "likeness are learned; high noise is where pose, framing and composition are. "
+                 "MiniMax's own default works out at about 8%, because it was tuned for video "
+                 "where one sample carries far more data than a single photo — on stills that "
+                 "leaves almost nothing for detail. For reference, Krea 2 spends about 30%. "
+                 "No cap and no right answer: type whatever you want to try. Higher means more "
+                 "detail training, but each of those steps also lands harder, so if a high value "
+                 "overbakes, drop the Learning Rate before you drop the number. Recorded in the "
+                 "LoRA's metadata and shown on the training queue, so runs stay comparable. "
+                 "'mid-concentrated' changes the SHAPE without changing that percentage: the "
+                 "same share of low-noise steps, but the rest bunched around the middle instead "
+                 "of spread evenly out to both extremes. Krea 2 and Klein both train that way. "
+                 "Worth an A/B — the number alone only controls how much, never where.",
+            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
+        self._minimax_shift_hint.grid(row=27, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+        # --- Blocks to Train (MiniMax only, experimental) ---------------------------------
+        self._minimax_blocks_label = ttk.Label(training_content, text="Blocks to Train:")
+        self._minimax_blocks_label.grid(row=28, column=0, sticky=tk.W, padx=5, pady=(8, 2))
+        self._minimax_blocks_frame = ttk.Frame(training_content)
+        self._minimax_blocks_frame.grid(row=28, column=1, columnspan=2, sticky=tk.W, padx=5, pady=(8, 2))
+        # Editable, not readonly — the presets are starting points and the real control is typing
+        # a spec. Anything the trainer's parser takes is legal here.
+        self.entries["MINIMAX_BLOCKS"] = ttk.Combobox(
+            self._minimax_blocks_frame, values=MINIMAX_BLOCK_OPTIONS, width=34)
+        self.entries["MINIMAX_BLOCKS"].pack(side=tk.LEFT)
+        self._select_combo_by_token(self.entries["MINIMAX_BLOCKS"],
+                                    self.settings.get("MINIMAX_BLOCKS", "all"))
+        # Live readout: a typed spec is easy to fat-finger, and "trained 3 blocks when you meant
+        # 30" is invisible in the output. Says how many blocks the box currently means.
+        self._minimax_blocks_count = tk.Label(self._minimax_blocks_frame, text="",
+                                              font=(FONT_FAMILY, 9), bg=COLORS["bg_surface"])
+        self._minimax_blocks_count.pack(side=tk.LEFT, padx=(10, 0))
+        self.entries["MINIMAX_BLOCKS"].bind(
+            "<KeyRelease>", lambda _e: self._refresh_minimax_blocks_count())
+        self.entries["MINIMAX_BLOCKS"].bind(
+            "<<ComboboxSelected>>", lambda _e: self._refresh_minimax_blocks_count())
+        self._minimax_blocks_hint = ttk.Label(
+            training_content,
+            text="EXPERIMENT — no recommended answer yet. H3 is 50 identical blocks and nobody has "
+                 "published what each one does. A block that doesn't carry identity still gets "
+                 "trained on something, and what's left for it to learn is your backgrounds, "
+                 "framing and lighting — so leaving blocks out may give a CLEANER likeness with "
+                 "less memorised set, not just a faster run. The ranges here are scaled from "
+                 "Klein's block map, a different architecture, so they're starting guesses. Train "
+                 "one against a full-model run on the same dataset and judge the pair: if a "
+                 "selection holds up, the blocks you left out weren't needed — whichever end they "
+                 "were. Type your own: ranges and single blocks, comma-separated, like "
+                 "3-12, 14-15, 22, 31-33. Blocks are numbered 0-49. "
+                 "Fewer blocks also means faster steps and a smaller file, and less capacity "
+                 "overall, so give a narrow range a few more epochs before calling it. The range "
+                 "is recorded in the LoRA's metadata as ss_train_blocks.",
+            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
+        self._minimax_blocks_hint.grid(row=29, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+        self._refresh_minimax_blocks_count()
+
+        # --- Reference distillation (MiniMax only, experimental) ---------------------------
+        # No picker: the dataset IS the reference pool, so there is nothing to choose.
+        self.minimax_distill_var = tk.BooleanVar(
+            value=bool(self.settings.get("MINIMAX_DISTILL", False)))
+        self._minimax_distill_frame = ttk.Frame(training_content)
+        self._minimax_distill_frame.grid(row=35, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(8, 0))
+        self._minimax_distill_cb = ttk.Checkbutton(
+            self._minimax_distill_frame, text="Learn identity from my dataset (reference distillation)",
+            variable=self.minimax_distill_var)
+        self._minimax_distill_cb.pack(side=tk.LEFT)
+        ttk.Label(self._minimax_distill_frame, text="   teacher ").pack(side=tk.LEFT)
+        self.entries["MINIMAX_DISTILL_WEIGHT"] = ttk.Combobox(
+            self._minimax_distill_frame, values=["0.6", "0.7", "0.8", "0.9", "1.0"], width=5)
+        self.entries["MINIMAX_DISTILL_WEIGHT"].set(
+            str(self.settings.get("MINIMAX_DISTILL_WEIGHT", "0.8")))
+        self.entries["MINIMAX_DISTILL_WEIGHT"].pack(side=tk.LEFT)
+        ttk.Label(self._minimax_distill_frame, text="   references each ").pack(side=tk.LEFT)
+        self.entries["MINIMAX_DISTILL_REFS"] = ttk.Combobox(
+            self._minimax_distill_frame, values=["1", "2", "3", "4"], width=4)
+        self.entries["MINIMAX_DISTILL_REFS"].set(
+            str(self.settings.get("MINIMAX_DISTILL_REFS", "2")))
+        self.entries["MINIMAX_DISTILL_REFS"].pack(side=tk.LEFT)
+        self._minimax_distill_hint = ttk.Label(
+            training_content,
+            text="EXPERIMENT — off by default. H3 can already render a person well when it is "
+                 "SHOWN a photo of them; this teaches your LoRA to do the same from the trigger "
+                 "word alone, so you do not need a reference at generation time. Your dataset is "
+                 "used exactly as normal — same folder, same captions, every image still trained "
+                 "on. The difference is what each answer is marked against: normally it is the "
+                 "photograph itself, which is why a LoRA also learns your backgrounds and "
+                 "framing. With this on, most of the marking comes from what the model produces "
+                 "when shown OTHER photos of her from the same folder — identity without the "
+                 "scenery. Every image takes a turn as a reference, and no image is ever its own "
+                 "(the model would just copy the answer). Teacher 0.8 means 80% of that and 20% "
+                 "still the real photo, which keeps genuine skin and texture; 1.0 is pure and "
+                 "caps the LoRA at what reference mode can already do. Needs the ref2va model in "
+                 "Preferences. Caching takes longer and uses more disk.",
+            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
+        self._minimax_distill_hint.grid(row=36, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+
+        # --- Base Precision (MiniMax only) -------------------------------------------------
+        # Auto picks the quantisation and the block-swap count TOGETHER. Deciding swap alone,
+        # with the precision already fixed by which file you loaded, gives mid-range cards the
+        # worst of both: the int8 base is ~21 GB, so a 24 GB card parks 38 of 50 blocks on CPU
+        # and crosses PCIe every step for ~4x the runtime, when the same file loaded 4-bit is
+        # ~11 GB and needs no swap at all.
+        self._minimax_quant_label = ttk.Label(training_content, text="Base Precision:")
+        self._minimax_quant_label.grid(row=37, column=0, sticky=tk.W, padx=5, pady=(8, 0))
+        self._minimax_quant_frame = ttk.Frame(training_content)
+        self._minimax_quant_frame.grid(row=37, column=1, sticky=tk.W, padx=5, pady=(8, 0))
+        self.entries["MINIMAX_BASE_QUANT"] = ttk.Combobox(
+            self._minimax_quant_frame, values=list(MINIMAX_BASE_QUANT_OPTIONS), width=30,
+            state="readonly")
+        self.entries["MINIMAX_BASE_QUANT"].set(
+            str(self.settings.get("MINIMAX_BASE_QUANT", MINIMAX_BASE_QUANT_OPTIONS[0])))
+        self.entries["MINIMAX_BASE_QUANT"].pack(side=tk.LEFT)
+        self._minimax_quant_hint = ttk.Label(
+            training_content,
+            text="Auto reads your FREE VRAM at launch and picks the base precision and block "
+                 "swap together. int8 is the checkpoint's own storage and the most accurate "
+                 "base (~0.17% error) — it needs about 30 GB free to run without block swap. "
+                 "4-bit loads the SAME file at ~11 GB instead of ~21, so it fits smaller cards "
+                 "with no swap, at ~9% error in the frozen base — the LoRA then spends some "
+                 "capacity correcting error that won't exist at inference. Auto only reaches "
+                 "for 4-bit when the alternative is most of the model crossing PCIe every step. "
+                 "Pin either one and the swap plan is built around your choice.",
+            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
+        self._minimax_quant_hint.grid(row=38, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+
+        # --- Slow blocks (MiniMax only, experimental): depth-dependent LR -------------------
+        self._minimax_slow_label = ttk.Label(training_content, text="Slower LR for blocks:")
+        self._minimax_slow_label.grid(row=33, column=0, sticky=tk.W, padx=5, pady=(8, 2))
+        self._minimax_slow_frame = ttk.Frame(training_content)
+        self._minimax_slow_frame.grid(row=33, column=1, columnspan=2, sticky=tk.W, padx=5, pady=(8, 2))
+        self.entries["MINIMAX_SLOW_BLOCKS"] = ttk.Entry(self._minimax_slow_frame, width=22)
+        self.entries["MINIMAX_SLOW_BLOCKS"].insert(
+            0, str(self.settings.get("MINIMAX_SLOW_BLOCKS", "") or ""))
+        self.entries["MINIMAX_SLOW_BLOCKS"].pack(side=tk.LEFT)
+        ttk.Label(self._minimax_slow_frame, text="  at ×").pack(side=tk.LEFT)
+        self.entries["MINIMAX_SLOW_LR_SCALE"] = ttk.Combobox(
+            self._minimax_slow_frame, values=["0.1", "0.2", "0.3", "0.5", "0.7"],
+            state="normal", width=6)
+        self.entries["MINIMAX_SLOW_LR_SCALE"].set(
+            str(self.settings.get("MINIMAX_SLOW_LR_SCALE", "0.2")))
+        self.entries["MINIMAX_SLOW_LR_SCALE"].pack(side=tk.LEFT, padx=(2, 0))
+        self._minimax_slow_hint = ttk.Label(
+            training_content,
+            text="EXPERIMENT — leave blank for one learning rate everywhere (normal). A change in "
+                 "a late block goes almost straight to the output, while a change early on gets "
+                 "smoothed out by the 40-odd blocks after it — so the same learning rate is "
+                 "gentle at the front of the model and violent at the back. If the later blocks "
+                 "wreck your samples at a rate the early ones handle fine, put those blocks here "
+                 "with a multiplier instead of dropping them: 21-49 at ×0.2 trains them at a "
+                 "fifth the rate. Same syntax as Blocks to Train, and only blocks you're actually "
+                 "training count. Adaptive LR still works — it moves both rates together and "
+                 "keeps the ratio.",
+            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
+        self._minimax_slow_hint.grid(row=34, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+
+        # --- Train AdaLN (MiniMax only, experimental) --------------------------------------
+        # A BooleanVar kept in self.entries so the preset/queue machinery picks it up for free.
+        self.entries["MINIMAX_TRAIN_ADALN"] = tk.BooleanVar(
+            value=bool(self.settings.get("MINIMAX_TRAIN_ADALN", False)))
+        self._minimax_adaln_cb = ttk.Checkbutton(
+            training_content, text="Train AdaLN (timestep modulation)",
+            variable=self.entries["MINIMAX_TRAIN_ADALN"])
+        self._minimax_adaln_cb.grid(row=31, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(8, 0))
+        self._minimax_adaln_hint = ttk.Label(
+            training_content,
+            text="EXPERIMENT — off by default (the reference trainer leaves it on). AdaLN is "
+                 "the part of the model that decides how strongly each block fires at each noise "
+                 "level. It only ever sees the noise level: not your image, not your prompt. So it "
+                 "CAN'T learn who someone is — but on this base it soaks up roughly 45% of "
+                 "everything your LoRA learns. Turning it off hands that capacity to the parts "
+                 "that do see the image. It may sharpen likeness, or it may cost you the timing "
+                 "control that makes the rest work — run it both ways on the same dataset. Only "
+                 "applies to the pruned int8 base; the bf16 one never trains AdaLN anyway.",
+            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
+        self._minimax_adaln_hint.grid(row=32, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+
+        self._refresh_minimax_shift_match()
+
+        # Answers "when do changes take effect?" (issue #40) right where people wonder it.
+        ttk.Label(training_content,
+                  text="When do changes apply? Settings are read when a run launches — changing "
+                       "them mid-run does nothing. Pause → Resume relaunches with your current "
+                       "settings, so these can be changed at a pause. Dataset/caption changes "
+                       "need a fresh run (Resume skips re-caching).",
+                  foreground=COLORS["text_explain"], font=(FONT_FAMILY, 8, "italic"),
+                  justify=tk.LEFT, wraplength=720).grid(
+            row=30, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
 
         # === Optimizer Section (Collapsed by default) ===
         optimizer_section = CollapsibleFrame(outer,"Optimizer", default_expanded=False)
@@ -3755,6 +4584,8 @@ class LoRATrainerGUI:
         defaults entry (Klein's block/timestep/adaptive presets don't apply); everything
         else gets the full Klein built-in set."""
         cfg = ARCHITECTURES.get(arch, {})
+        if cfg.get("is_minimax"):
+            return MINIMAX_BUILT_IN_PRESETS
         return KREA2_BUILT_IN_PRESETS if cfg.get("is_krea2") else BUILT_IN_PRESETS
 
     def refresh_preset_combobox(self):
@@ -3848,6 +4679,12 @@ class LoRATrainerGUI:
             self._on_timestep_sampling_changed()
             self._on_weighting_scheme_changed()
             self._update_noise_range_label()
+        # Network Type drives a ROW SWAP (rank/alpha <-> LoKR factor), and setting a combobox
+        # programmatically does NOT fire <<ComboboxSelected>> — so without this a preset that
+        # changes the type left the old rows on screen: "LoRA (standard)" selected with the
+        # LoKR Factor box still underneath it.
+        if "NETWORK_TYPE" in preset and "LOKR_FACTOR" in getattr(self, "rows", {}):
+            self._on_network_type_changed()
 
         # Update FP8/SCALED checkboxes from preset
         if "FP8" in preset:
@@ -3917,6 +4754,11 @@ class LoRATrainerGUI:
             except (AttributeError, tk.TclError):
                 pass
 
+        if "MINIMAX_DISTILL" in preset and hasattr(self, "minimax_distill_var"):
+            self.minimax_distill_var.set(bool(preset["MINIMAX_DISTILL"]))
+        if "MINIMAX_LOGNORM" in preset and hasattr(self, "minimax_lognorm_var"):
+            self.minimax_lognorm_var.set(bool(preset["MINIMAX_LOGNORM"]))
+
         # Model Area to Train (training preset dropdown)
         if "TARGET_LAYERS" in preset and hasattr(self, 'training_preset_var'):
             legacy_map = {
@@ -3975,6 +4817,11 @@ class LoRATrainerGUI:
         try:
             os.makedirs(PRESETS_DIR, exist_ok=True)
             snapshot = self._collect_preset_values()
+            # Presets deliberately don't carry the family (a Krea 2 preset must not hijack your
+            # model choice), but "restore my last launch" plainly includes WHICH model it was —
+            # the same reasoning the training queue uses when it stores the architecture beside
+            # its snapshot. Namespaced so _apply_preset_values ignores it as an unknown key.
+            snapshot["__architecture__"] = self.architecture_var.get()
             with open(LAST_TRAIN_FILE, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, indent=2, default=str)
         except Exception as e:
@@ -3992,10 +4839,617 @@ class LoRATrainerGUI:
         try:
             with open(LAST_TRAIN_FILE, "r", encoding="utf-8") as f:
                 snapshot = json.load(f)
+            # Switch family FIRST if the launch was on a different one: on_architecture_changed
+            # loads that family's default preset, so doing it after would clobber everything the
+            # snapshot just restored. Older snapshots have no architecture — they simply skip this.
+            _arch = snapshot.pop("__architecture__", None)
+            _switched = ""
+            if _arch and _arch in ARCHITECTURES and _arch != self.architecture_var.get():
+                self.architecture_var.set(_arch)
+                self.on_architecture_changed()
+                _switched = f"\n\nSwitched the Base Model back to {_arch}."
             self._apply_preset_values(snapshot)
-            messagebox.showinfo("Loaded", "Restored settings from your last training launch.")
+            messagebox.showinfo("Loaded",
+                                f"Restored settings from your last training launch.{_switched}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load last train settings:\n{e}")
+
+    # ------------------------------------------------------------
+    # Training queue — settings snapshots that run back-to-back
+    # ------------------------------------------------------------
+    # A queue item is everything a run needs that the GUI would otherwise read live:
+    # the preset snapshot (_collect_preset_values), the architecture (presets are
+    # per-arch and deliberately don't carry it), the Start-tab dataset folder, and the
+    # Samples-tab entries (presets deliberately skip those too). Restoring an item is
+    # "load these into the GUI, then press Start" — the queue never bypasses
+    # start_training, so validation, TOML regeneration, snapshotting and the pause
+    # machinery all behave exactly as for a hand-started run.
+
+    def _load_training_queue(self):
+        if _persist_disabled():
+            return []
+        try:
+            with open(QUEUE_FILE, "r", encoding="utf-8") as f:
+                items = json.load(f)
+            if not isinstance(items, list):
+                print(f"[queue] {QUEUE_FILE} does not hold a list — starting with an empty queue")
+                return []
+            good = [i for i in items if self._queue_item_valid(i)]
+            if len(good) != len(items):
+                print(f"[queue] dropped {len(items) - len(good)} unreadable entr(ies) from {QUEUE_FILE}")
+            return good
+        except FileNotFoundError:
+            return []
+        except Exception as e:
+            print(f"[queue] failed to load {QUEUE_FILE}: {e}")
+            return []
+
+    def _save_training_queue(self):
+        if _persist_disabled():
+            return
+        try:
+            os.makedirs(PRESETS_DIR, exist_ok=True)
+            tmp = QUEUE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.training_queue, f, indent=2, default=str)
+            os.replace(tmp, QUEUE_FILE)
+        except Exception as e:
+            print(f"[queue] failed to save: {e}")
+
+    @staticmethod
+    def _queue_item_valid(item):
+        """Deep-enough validation for anything about to flow into apply/summary/advance.
+        Shallow checks (dict with a dict preset) let hand-edited variants through that then
+        crashed AFTER the item was popped and saved away — losing it before the traceback."""
+        return (isinstance(item, dict)
+                and isinstance(item.get("preset"), dict)
+                and isinstance(item.get("image_folder", ""), str)
+                and isinstance(item.get("architecture", ""), str)
+                and isinstance(item.get("samples", {}), dict))
+
+    def _schedule_queue_advance(self, delay_ms):
+        """The ONE way to arm a queue-advance timer. A generation counter makes every
+        previously-armed timer a no-op: Stop, Pause, a failure-HOLD, or a manual start bumps
+        the generation, so a stale after() callback from before the state change can never
+        fire into a paused/held queue or double-launch across a pipeline phase gap."""
+        gen = getattr(self, "_queue_advance_gen", 0)
+
+        def _tick():
+            if getattr(self, "_queue_advance_gen", 0) == gen:
+                self._start_next_queued()
+        self.master.after(delay_ms, _tick)
+
+    def _cancel_pending_queue_advance(self):
+        self._queue_advance_gen = getattr(self, "_queue_advance_gen", 0) + 1
+
+    _QUEUE_SAMPLE_KEYS = ("SAMPLE_ENABLED", "SAMPLE_WIDTH", "SAMPLE_HEIGHT", "SAMPLE_STEPS",
+                          "SAMPLE_SEED", "SAMPLE_EVERY_N_EPOCHS", "SAMPLE_EVERY_N_STEPS",
+                          "SAMPLE_AT_FIRST", "SAMPLE_FLOW_SHIFT", "SAMPLE_NEGATIVE",
+                          "SAMPLE_CFG_SCALE")
+
+    def _queue_snapshot(self):
+        """Capture the currently configured run as a queue item."""
+        import time as _time
+        samples = {}
+        for k in self._QUEUE_SAMPLE_KEYS:
+            entry = self.entries.get(k)
+            if entry is None:
+                continue
+            try:
+                samples[k] = entry.get()
+            except Exception:
+                pass
+        return {
+            "id": f"q{int(_time.time() * 1000)}",
+            "queued_at": _time.strftime("%Y-%m-%d %H:%M"),
+            "architecture": self.architecture_var.get(),
+            "image_folder": self.image_folder_var.get().strip(),
+            "preset": self._collect_preset_values(),
+            "samples": samples,
+        }
+
+    def _apply_queue_item(self, item):
+        """Load a queue item's settings back into the GUI (arch first — it swaps the UI)."""
+        arch = item.get("architecture", "")
+        if isinstance(arch, str) and arch and arch in ARCHITECTURES and self.architecture_var.get() != arch:
+            self.architecture_var.set(arch)
+            try:
+                self.update_ui_for_architecture()
+            except Exception as e:
+                self.update_console(f"[queue] arch switch to {arch!r} failed: {e}\n")
+        self._apply_preset_values(item.get("preset", {}))
+        folder = str(item.get("image_folder") or "").strip()
+        if folder:
+            self.image_folder_var.set(folder)   # traces regenerate Fizgig_train.toml
+        _samples = item.get("samples")
+        for k, v in (_samples.items() if isinstance(_samples, dict) else ()):
+            entry = self.entries.get(k)
+            if entry is None:
+                continue
+            try:
+                if isinstance(entry, (tk.BooleanVar, tk.StringVar, tk.IntVar, tk.DoubleVar)):
+                    entry.set(v)
+                elif isinstance(entry, ttk.Combobox):
+                    entry.set(str(v))
+                else:
+                    entry.delete(0, tk.END)
+                    entry.insert(0, str(v))
+            except Exception:
+                pass
+
+    @staticmethod
+    def _queue_signature(item):
+        """What makes two queue entries THE SAME RUN: everything except id/queued_at."""
+        try:
+            return json.dumps({k: item.get(k) for k in
+                               ("architecture", "image_folder", "preset", "samples")},
+                              sort_keys=True, default=str)
+        except Exception:
+            return repr(item)
+
+    @staticmethod
+    def _queue_output_key(item):
+        """(output dir, LoRA name) — two runs writing here overwrite each other's files."""
+        p = item.get("preset", {}) if isinstance(item.get("preset"), dict) else {}
+        return (str(p.get("LORA_OUTPUT_DIR", "")).strip().lower().replace("\\", "/").rstrip("/"),
+                str(p.get("LORA_NAME", "")).strip().lower())
+
+    def _queue_current_run(self):
+        """Snapshot the current config to the end of the queue (Start pressed mid-run)."""
+        item = self._queue_snapshot()
+        if not item["image_folder"]:
+            messagebox.showwarning(
+                "Nothing to queue",
+                "Pick a training image folder on the Start tab first — a queued run "
+                "needs to know its dataset.")
+            return
+        # An exact duplicate (same everything) is never useful — it would just train the
+        # identical run twice. Point at the existing entry instead of adding another.
+        sig = self._queue_signature(item)
+        for pos, q in enumerate(self.training_queue):
+            if self._queue_signature(q) == sig:
+                messagebox.showinfo(
+                    "Already queued",
+                    f"This exact run is already in the queue (position {pos + 1}).\n\n"
+                    "Change something — the dataset, the output name, any setting — "
+                    "to queue a different run.")
+                return
+        # Same output dir + name as another queued job (or the run in progress) with
+        # DIFFERENT settings: the later run would overwrite the earlier one's checkpoints,
+        # state dirs and samples. Flag it; queueing anyway is a legitimate choice.
+        okey = self._queue_output_key(item)
+        if okey != ("", ""):
+            clash = next((f"queued job {pos + 1}" for pos, q in enumerate(self.training_queue)
+                          if self._queue_output_key(q) == okey), None)
+            if clash is None:
+                _active = getattr(self, "_active_run_item", None)
+                if (_active is not None
+                        and getattr(self, "training_state", "idle") in ("running", "pausing")
+                        and self._queue_output_key(_active) == okey):
+                    clash = "the run in progress"
+            if clash is not None and not messagebox.askyesno(
+                    "Same output name",
+                    f"This run writes to the same output folder and LoRA name as {clash} — "
+                    f"its checkpoints, state dirs and samples would be overwritten.\n\n"
+                    f"Queue it anyway? (Change the Output Name to keep both.)"):
+                return
+        self.training_queue.append(item)
+        self._save_training_queue()
+        self._refresh_queue_button()
+        self._render_queue_window()
+        name = item["preset"].get("LORA_NAME") or os.path.basename(item["image_folder"])
+        self.update_console(f"[queue] added '{name}' — position {len(self.training_queue)} in the "
+                            f"queue. It starts automatically when the current run finishes.\n")
+
+    def _start_next_queued(self):
+        """Pop the head of the queue into the GUI and start it. Never called while busy."""
+        _proc = getattr(self, "current_process", None)
+        if _proc is not None and _proc.poll() is None:
+            return
+        # Process-gone is NOT idle: between pipeline phases current_process is briefly None
+        # while training_state is still "running", and paused/pausing runs own the GPU's
+        # future. A stale timer or an eager click must not launch into any of those.
+        if getattr(self, "training_state", "idle") in ("running", "pausing", "paused"):
+            return
+        if not self.training_queue:
+            return
+        # A training subprocess isn't the only thing that owns the GPU: a Royale export, a
+        # caption batch, an Extract or a live preview are all in-process threads the process
+        # check can't see. Launching a run on top of them OOMs it (and a failed run HOLDS
+        # the queue — the worst outcome for an unattended batch). Wait and retry — capped,
+        # so a stuck busy flag can't spin forever: after ~10 minutes the queue HOLDs loudly.
+        try:
+            if self._is_any_busy():
+                self._queue_busy_retries = getattr(self, "_queue_busy_retries", 0) + 1
+                if self._queue_busy_retries > 40:
+                    self._queue_busy_retries = 0
+                    self.update_console("[queue] HELD — the app has reported other GPU work "
+                                        "for 10+ minutes. Finish or cancel it, then use "
+                                        "'Start next now' in the queue window.\n")
+                    self._render_queue_window()
+                    return
+                self.update_console("[queue] GPU work in progress elsewhere in the app — "
+                                    "next run retries in 15 s.\n")
+                self._schedule_queue_advance(15000)
+                return
+        except Exception:
+            pass
+        self._queue_busy_retries = 0
+        head = self.training_queue[0]
+        # Malformed item (hand-edited/corrupted queue file): remove it LOUDLY, then move on
+        # to the next — one bad entry must not wedge the whole queue or crash the advance.
+        if not self._queue_item_valid(head):
+            self.training_queue.pop(0)
+            self._save_training_queue()
+            self._refresh_queue_button()
+            self._render_queue_window()
+            self.update_console("[queue] removed an unreadable queue entry (corrupt or "
+                                "hand-edited queue file) — continuing with the next.\n")
+            self._schedule_queue_advance(100)
+            return
+        # Dataset gone (deleted/renamed/moved since queueing): without this check the stale
+        # TOML silently trains the PREVIOUS job's dataset under this job's name. HOLD with
+        # the item still queued so nothing is lost.
+        folder = (head.get("image_folder") or "").strip()
+        if not os.path.isdir(folder):
+            self.update_console(f"[queue] HELD — the next run's image folder no longer exists:\n"
+                                f"        {folder}\n"
+                                f"        Restore the folder (or edit/delete the queued job in "
+                                f"the queue window), then 'Start next now'.\n")
+            self._render_queue_window()
+            return
+        item = self.training_queue.pop(0)
+        self._save_training_queue()
+        self._refresh_queue_button()
+        name = item.get("preset", {}).get("LORA_NAME") or os.path.basename(item.get("image_folder", "?"))
+        self.update_console(f"\n[queue] starting next run: '{name}' "
+                            f"({len(self.training_queue)} still queued)\n")
+        self._apply_queue_item(item)
+        self.start_training()
+        # start_training can decline (validation, disk warning declined). The item's settings
+        # are in the GUI either way; put it back at the head so nothing is silently lost.
+        if getattr(self, "training_state", "idle") != "running":
+            self.training_queue.insert(0, item)
+            self._save_training_queue()
+            self._refresh_queue_button()
+            # Invalidate any timer armed before this decline — otherwise a pending advance
+            # re-pops the same head and repeats the same modal validation error in a loop.
+            self._cancel_pending_queue_advance()
+            self.update_console("[queue] run did not start — it stays at the head of the queue. "
+                                "Fix the issue and use the queue window's 'Start next' button.\n")
+        self._render_queue_window()
+
+    def _refresh_queue_button(self):
+        btn = getattr(self, "_queue_btn", None)
+        if btn is None:
+            return
+        n = len(getattr(self, "training_queue", []))
+        try:
+            # Dark text on the light blue in BOTH states — the old accent-blue-when-queued
+            # would now be mid-blue on baby blue (~2:1, unreadable). The count carries the
+            # signal instead.
+            btn.config(text=f"📋 Queue ({n})" if n else "📋 Queue",
+                       bg=COLORS["queue_blue"], fg=COLORS["bg_deep"])
+        except Exception:
+            pass
+
+    def _queue_thumbnail(self, folder, size=56):
+        """PhotoImage of the first image in `folder`, or None. Caller keeps the reference."""
+        try:
+            from fizgig.dataset.image_dataset import IMAGE_EXTENSIONS
+            exts = {e.lower() for e in IMAGE_EXTENSIONS}
+            first = next((f for f in sorted(os.listdir(folder))
+                          if os.path.splitext(f)[1].lower() in exts), None)
+            if first is None:
+                return None
+            img = Image.open(os.path.join(folder, first))
+            img.thumbnail((size, size), Image.LANCZOS)
+            return ImageTk.PhotoImage(img)
+        except Exception:
+            return None
+
+    def _open_queue_window(self):
+        """The queue manager: one row per queued run — thumbnail, key settings, and the
+        operations (reorder / edit in tab / update from tab / delete / start next)."""
+        win = getattr(self, "_queue_win", None)
+        if win is not None and win.winfo_exists():
+            win.lift()
+            self._render_queue_window()
+            return
+        win = tk.Toplevel(self.master)
+        win.title("Training Queue")
+        win.geometry("860x560")
+        win.configure(bg=COLORS["bg_deep"])
+        self._queue_win = win
+
+        tk.Label(win, text="Training Queue", font=(FONT_FAMILY, 16, "bold"),
+                 bg=COLORS["bg_deep"], fg=COLORS["text_primary"]).pack(anchor=tk.W, padx=16, pady=(14, 0))
+        self._queue_win_status = tk.Label(win, text="", font=(FONT_FAMILY, 9),
+                                          bg=COLORS["bg_deep"], fg=COLORS["text_muted"],
+                                          justify=tk.LEFT)
+        self._queue_win_status.pack(anchor=tk.W, padx=16, pady=(2, 8))
+
+        holder = tk.Frame(win, bg=COLORS["bg_deep"])
+        holder.pack(fill=tk.BOTH, expand=True, padx=16)
+        canvas = tk.Canvas(holder, bg=COLORS["bg_deep"], highlightthickness=0)
+        vsb = ttk.Scrollbar(holder, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        rows = tk.Frame(canvas, bg=COLORS["bg_deep"])
+        cw = canvas.create_window((0, 0), window=rows, anchor="nw")
+        rows.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(cw, width=e.width))
+        # Wheel: global router — scrolls this canvas when the pointer is over the window,
+        # the main app everywhere else, with no bind_all steal in either direction.
+        self._queue_rows_frame = rows
+
+        foot = tk.Frame(win, bg=COLORS["bg_deep"])
+        foot.pack(fill=tk.X, padx=16, pady=12)
+        self._queue_start_next_btn = ttk.Button(foot, text="▶ Start next now",
+                                                command=self._start_next_queued, style="Primary.TButton")
+        self._queue_start_next_btn.pack(side=tk.LEFT)
+        ttk.Button(foot, text="Clear queue", command=self._queue_clear_all).pack(side=tk.LEFT, padx=(12, 0))
+        tk.Label(foot, text="Queued runs start automatically when the current run finishes cleanly. "
+                            "After a failure, a Stop, or an app restart, the queue waits for you.",
+                 font=(FONT_FAMILY, 8), bg=COLORS["bg_deep"], fg=COLORS["text_explain"],
+                 wraplength=420, justify=tk.LEFT).pack(side=tk.RIGHT)
+        self._render_queue_window()
+
+    def _queue_clear_all(self):
+        if self.training_queue and messagebox.askyesno(
+                "Clear queue", f"Remove all {len(self.training_queue)} queued run(s)?"):
+            self.training_queue.clear()
+            self._save_training_queue()
+            self._refresh_queue_button()
+            self._render_queue_window()
+
+    def _queue_row_summary(self, item):
+        p = item.get("preset", {}) if isinstance(item.get("preset"), dict) else {}
+        folder = str(item.get("image_folder") or "")
+        try:
+            from fizgig.dataset.image_dataset import IMAGE_EXTENSIONS
+            _exts = {e.lower() for e in IMAGE_EXTENSIONS}
+            n_imgs = sum(1 for f in os.listdir(folder)
+                         if os.path.splitext(f)[1].lower() in _exts) if os.path.isdir(folder) else 0
+        except Exception:
+            n_imgs = 0
+        name = p.get("LORA_NAME") or os.path.basename(folder) or "(unnamed)"
+        bits = [f"{item.get('architecture', '?')}",
+                f"{os.path.basename(folder) or '?'} ({n_imgs} images)"]
+        for label, key in (("LR", "LEARNING_RATE"), ("epochs", "MAX_TRAIN_EPOCHS"),
+                           ("dim", "NETWORK_DIM"), ("type", "NETWORK_TYPE"),
+                           ("area", "TARGET_LAYERS")):
+            v = p.get(key)
+            if v not in (None, ""):
+                bits.append(f"{label} {v}")
+        # Detail Focus only means anything for MiniMax, and it's the whole point of queueing a
+        # shift sweep — without it two rows of an A/B look identical in the manager.
+        if ARCHITECTURES.get(item.get("architecture", ""), {}).get("is_minimax"):
+            _sh = str(p.get("MINIMAX_LOWNOISE_PCT") or "").strip()
+            if _sh:
+                bits.append(f"low-noise {_sh}%" + (" mid" if p.get("MINIMAX_LOGNORM") else ""))
+            _bl = minimax_block_spec(p.get("MINIMAX_BLOCKS"))
+            if _bl.lower() != "all":
+                bits.append(f"blocks {_bl}")
+            if p.get("MINIMAX_TRAIN_ADALN") is False:
+                bits.append("no adaln")
+            if p.get("MINIMAX_DISTILL"):
+                bits.append(f"distill x{p.get('MINIMAX_DISTILL_WEIGHT', '0.8')}"
+                            f" ({p.get('MINIMAX_DISTILL_REFS', '2')} refs)")
+            _sl = str(p.get("MINIMAX_SLOW_BLOCKS") or "").strip()
+            if _sl and str(p.get("MINIMAX_SLOW_LR_SCALE", "1")).strip() not in ("", "1", "1.0"):
+                bits.append(f"slow {_sl} ×{p.get('MINIMAX_SLOW_LR_SCALE')}")
+        return name, "  ·  ".join(str(b) for b in bits) + f"\nqueued {item.get('queued_at', '?')}"
+
+    def _render_queue_window(self):
+        rows = getattr(self, "_queue_rows_frame", None)
+        if rows is None or not rows.winfo_exists():
+            return
+        for w in rows.winfo_children():
+            w.destroy()
+        self._queue_thumb_refs = []
+        _busy = getattr(self, "current_process", None)
+        _busy = _busy is not None and _busy.poll() is None
+        _state = getattr(self, "training_state", "idle")
+        _active = getattr(self, "_active_run_item", None)
+        _show_active = _active is not None and (_busy or _state in ("running", "pausing", "paused"))
+        try:
+            n = len(self.training_queue)
+            # Starting the next run while one is PAUSED would silently abandon the paused
+            # run (its state dir resumes nothing once another run overwrites the GUI), so
+            # paused disables the button just like busy does.
+            _blocked = _busy or _state in ("pausing", "paused")
+            self._queue_start_next_btn.config(
+                state=(tk.DISABLED if (_blocked or not n) else tk.NORMAL))
+            if _busy and _state == "pausing":
+                txt = (f"{n} run(s) queued — the current run is pausing at the epoch end. "
+                       f"A pause HOLDS the queue: Resume from the Training tab, or start the "
+                       f"next run from here after it exits.") if n else \
+                      "The current run is pausing at the epoch end."
+            elif _busy:
+                txt = (f"{n} run(s) queued — a run is active; the queue continues when it "
+                       f"finishes cleanly." if n else
+                       "A run is active and nothing is queued. The Start Training button reads "
+                       "'Queue Train' — click it to add the currently configured run.")
+            elif _state == "paused":
+                txt = (f"{n} run(s) queued — a run is PAUSED. Resume it from the Training tab; "
+                       f"'Start next now' is disabled because it would abandon the paused run."
+                       if n else
+                       "A run is paused — Resume it from the Training tab.")
+            elif n:
+                txt = (f"{n} run(s) queued — nothing is training. The queue HOLDS after a "
+                       f"failure or Stop; use 'Start next now' to begin or continue.")
+            else:
+                txt = ("Queue is empty. While a run is active, the Start Training button "
+                       "becomes 'Queue Train' — click it to add the currently configured run.")
+            self._queue_win_status.config(text=txt)
+        except Exception:
+            pass
+
+        # The run in progress, pinned on top — it isn't a queue item (never saved, can't be
+        # reordered or deleted), but after editing a queued job in the Training tab, its ✎ is
+        # the way BACK to the settings that are actually running.
+        if _show_active:
+            badge = ("⏸ paused" if _state == "paused" else
+                     "⏸ pausing at epoch end" if _state == "pausing" else "▶ training now")
+            card = tk.Frame(rows, bg=COLORS["bg_surface"],
+                            highlightbackground=COLORS["accent"], highlightthickness=2)
+            card.pack(fill=tk.X, pady=(0, 8))
+            thumb = self._queue_thumbnail(_active.get("image_folder", ""))
+            if thumb is not None:
+                self._queue_thumb_refs.append(thumb)
+                tk.Label(card, image=thumb, bg=COLORS["bg_surface"]).pack(side=tk.LEFT, padx=10, pady=8)
+            else:
+                tk.Label(card, text="🖼", font=(FONT_FAMILY, 20), width=3,
+                         bg=COLORS["bg_surface"], fg=COLORS["text_muted"]).pack(side=tk.LEFT, padx=10, pady=8)
+            act = tk.Frame(card, bg=COLORS["bg_surface"])
+            act.pack(side=tk.RIGHT, padx=10, pady=8)
+            name, summary = self._queue_row_summary(_active)
+            txt = tk.Frame(card, bg=COLORS["bg_surface"])
+            txt.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=8)
+            tk.Label(txt, text=f"{badge}  —  {name}", font=(FONT_FAMILY, 11, "bold"),
+                     bg=COLORS["bg_surface"], fg=COLORS["accent"], anchor="w",
+                     wraplength=520, justify=tk.LEFT).pack(anchor=tk.W)
+            tk.Label(txt, text=summary.split("\n")[0], font=(FONT_FAMILY, 8),
+                     bg=COLORS["bg_surface"], fg=COLORS["text_muted"], anchor="w",
+                     wraplength=520, justify=tk.LEFT).pack(anchor=tk.W)
+            abtn = tk.Button(act, text="✎", font=(FONT_FAMILY, 10), width=3,
+                             bg=COLORS["bg_surface"], fg=COLORS["text_primary"],
+                             activebackground=COLORS["border"], relief="flat", bd=0,
+                             cursor="hand2", command=self._queue_restore_active)
+            abtn.pack(side=tk.LEFT, padx=2)
+            ToolTip(abtn, "Load this run's settings back into the Training tab — the way back "
+                          "after editing a queued job")
+            if _busy:
+                cbtn = tk.Button(act, text="■", font=(FONT_FAMILY, 10), width=3,
+                                 bg=COLORS["bg_surface"], fg=COLORS["error"],
+                                 activebackground=COLORS["border"], relief="flat", bd=0,
+                                 cursor="hand2", command=self._queue_cancel_active)
+                cbtn.pack(side=tk.LEFT, padx=2)
+                ToolTip(cbtn, "Stop this run (no save). Queued runs HOLD — they won't "
+                              "auto-start after a cancel")
+
+        if not self.training_queue:
+            return
+        for i, item in enumerate(list(self.training_queue)):
+            # One corrupt entry (hand-edited file, interrupted write) must not take the
+            # whole window down — render it as removable wreckage instead.
+            if not isinstance(item, dict) or not isinstance(item.get("preset"), dict):
+                bad = tk.Frame(rows, bg=COLORS["bg_surface"],
+                               highlightbackground=COLORS["error"], highlightthickness=1)
+                bad.pack(fill=tk.X, pady=(0, 8))
+                tk.Label(bad, text=f"{i + 1}.  ⚠ unreadable queue entry (corrupt or hand-edited "
+                                   f"queue file)", font=(FONT_FAMILY, 10),
+                         bg=COLORS["bg_surface"], fg=COLORS["error"]).pack(side=tk.LEFT, padx=10, pady=10)
+                tk.Button(bad, text="✕", font=(FONT_FAMILY, 10), width=3,
+                          bg=COLORS["bg_surface"], fg=COLORS["text_primary"],
+                          activebackground=COLORS["border"], relief="flat", bd=0, cursor="hand2",
+                          command=lambda i=i: self._queue_delete(i)).pack(side=tk.RIGHT, padx=10)
+                continue
+            card = tk.Frame(rows, bg=COLORS["bg_surface"],
+                            highlightbackground=COLORS["border"], highlightthickness=1)
+            card.pack(fill=tk.X, pady=(0, 8))
+            thumb = self._queue_thumbnail(item.get("image_folder", ""))
+            if thumb is not None:
+                self._queue_thumb_refs.append(thumb)
+                tk.Label(card, image=thumb, bg=COLORS["bg_surface"]).pack(side=tk.LEFT, padx=10, pady=8)
+            else:
+                tk.Label(card, text="🖼", font=(FONT_FAMILY, 20), width=3,
+                         bg=COLORS["bg_surface"], fg=COLORS["text_muted"]).pack(side=tk.LEFT, padx=10, pady=8)
+            # Buttons pack FIRST (from the right): pack allocates space in order, so a long
+            # unwrapped summary used to squeeze the ↑↓✎⤓✕ column clean off the card —
+            # "my queued jobs have no delete button".
+            btns = tk.Frame(card, bg=COLORS["bg_surface"])
+            btns.pack(side=tk.RIGHT, padx=10, pady=8)
+            name, summary = self._queue_row_summary(item)
+            txt = tk.Frame(card, bg=COLORS["bg_surface"])
+            txt.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=8)
+            tk.Label(txt, text=f"{i + 1}.  {name}", font=(FONT_FAMILY, 11, "bold"),
+                     bg=COLORS["bg_surface"], fg=COLORS["text_primary"], anchor="w",
+                     wraplength=520, justify=tk.LEFT).pack(anchor=tk.W)
+            tk.Label(txt, text=summary, font=(FONT_FAMILY, 8),
+                     bg=COLORS["bg_surface"], fg=COLORS["text_muted"], anchor="w",
+                     wraplength=520, justify=tk.LEFT).pack(anchor=tk.W)
+
+            def _mk(parent, label, cmd, tip):
+                b = tk.Button(parent, text=label, font=(FONT_FAMILY, 10), width=3,
+                              bg=COLORS["bg_surface"], fg=COLORS["text_primary"],
+                              activebackground=COLORS["border"], relief="flat", bd=0,
+                              cursor="hand2", command=cmd)
+                b.pack(side=tk.LEFT, padx=2)
+                ToolTip(b, tip)
+                return b
+            _mk(btns, "↑", lambda i=i: self._queue_move(i, -1), "Move up")
+            _mk(btns, "↓", lambda i=i: self._queue_move(i, +1), "Move down")
+            _mk(btns, "✎", lambda i=i: self._queue_edit(i),
+                "Load this run's settings into the Training tab to edit them")
+            _mk(btns, "⤓", lambda i=i: self._queue_update_from_tab(i),
+                "Overwrite this queued run with the Training tab's current settings")
+            _mk(btns, "✕", lambda i=i: self._queue_delete(i), "Remove from queue")
+
+    def _queue_move(self, i, delta):
+        j = i + delta
+        if 0 <= i < len(self.training_queue) and 0 <= j < len(self.training_queue):
+            q = self.training_queue
+            q[i], q[j] = q[j], q[i]
+            self._save_training_queue()
+            self._render_queue_window()
+
+    def _queue_delete(self, i):
+        if 0 <= i < len(self.training_queue):
+            self.training_queue.pop(i)
+            self._save_training_queue()
+            self._refresh_queue_button()
+            self._render_queue_window()
+
+    def _queue_cancel_active(self):
+        """Stop the run in progress from the queue window's pinned card. Confirmed first —
+        the Training tab's own Stop button stays instant, but here a misclick between rows
+        would kill hours of work. The existing hold policy applies: queued runs do NOT
+        auto-start after a cancel."""
+        _proc = getattr(self, "current_process", None)
+        if _proc is None or _proc.poll() is not None:
+            self._render_queue_window()
+            return
+        name = (getattr(self, "_active_run_item", None) or {}).get("preset", {}).get("LORA_NAME", "this run")
+        if not messagebox.askyesno(
+                "Stop training?",
+                f"Stop '{name}' now? Progress since the last checkpoint is lost, and queued "
+                f"runs will HOLD rather than auto-start.\n\n(To finish the epoch and save "
+                f"first, use Pause Training on the Training tab instead.)"):
+            return
+        self.stop_training()
+        self._render_queue_window()
+
+    def _queue_restore_active(self):
+        """Put the RUNNING job's settings back into the Training tab (the ✎ on the pinned
+        'training now' card) — the undo for having edited a queued job in the tab."""
+        item = getattr(self, "_active_run_item", None)
+        if item is None:
+            return
+        self._apply_queue_item(item)
+        self.update_console("[queue] Training tab restored to the run in progress.\n")
+
+    def _queue_edit(self, i):
+        """Load the item into the Training tab. The item stays queued — after editing,
+        use ⤓ on the same row to write the changes back."""
+        if not (0 <= i < len(self.training_queue)):
+            return
+        self._apply_queue_item(self.training_queue[i])
+        self.update_console(f"[queue] loaded run {i + 1} into the Training tab — edit, then use "
+                            f"the ⤓ button on its queue row to save the changes back.\n")
+
+    def _queue_update_from_tab(self, i):
+        if not (0 <= i < len(self.training_queue)):
+            return
+        old = self.training_queue[i]
+        item = self._queue_snapshot()
+        item["id"], item["queued_at"] = old.get("id", item["id"]), old.get("queued_at", item["queued_at"])
+        self.training_queue[i] = item
+        self._save_training_queue()
+        self._render_queue_window()
+        self.update_console(f"[queue] run {i + 1} updated from the Training tab's current settings.\n")
 
     # Keys in self.entries that belong to OTHER tabs — skipped when collecting
     # a training-tab preset. Everything else in self.entries is fair game.
@@ -4058,6 +5512,11 @@ class LoRATrainerGUI:
         _grab("krea2_per_image_lr_var", "KREA2_PER_IMAGE_LR")
         _grab("krea2_auto_recaption_var", "KREA2_AUTO_RECAPTION")
         _grab("krea2_warmup_look_var", "KREA2_WARMUP_LOOK")
+        # MiniMax reference distillation. A plain StringVar, so the generic self.entries sweep
+        # above does NOT see it — without this a queued distillation run loses its reference
+        # and silently becomes an ordinary run (tests/test_minimax_distill_gui.py).
+        _grab("minimax_distill_var", "MINIMAX_DISTILL")
+        _grab("minimax_lognorm_var", "MINIMAX_LOGNORM")
         _grab("grad_checkpoint_var", "GRADIENT_CHECKPOINTING")
         _grab("fp8_text_encoder_var", "FP8_TEXT_ENCODER")
         _grab("adaptive_lr_var", "ADAPTIVE_LR")
@@ -4336,8 +5795,75 @@ class LoRATrainerGUI:
         # hide lists in _apply_training_arch_visibility once krea2_train supports it.
         self._apply_training_arch_visibility(config.get("is_krea2", False))
 
+    @staticmethod
+    def _select_combo_by_token(combo, value):
+        """Select the option whose FIRST whitespace-separated token equals `value`.
+
+        Labelled dropdowns here carry a trailing note ("12 - reference default, 5% detail band")
+        while settings/presets store only the bare token. Matching on the token means the note
+        can be reworded without invalidating anyone's saved runs or queued items."""
+        want = str(value).split(" ")[0]
+        try:
+            for opt in (combo.cget("values") or ()):
+                if str(opt).split(" ")[0] == want:
+                    combo.set(str(opt))
+                    return True
+        except tk.TclError:
+            pass
+        return False
+
+    def _refresh_minimax_shift_match(self):
+        """Show the schedule the typed percentage produces, or why it can't be read.
+
+        The relationship is very non-linear at the ends — 5% is shift 19, 2% is shift 49 — so the
+        resulting shift and median noise level are worth seeing next to the number you typed."""
+        lbl = getattr(self, "_minimax_shift_match", None)
+        ent = self.entries.get("MINIMAX_LOWNOISE_PCT")
+        if lbl is None or ent is None or not lbl.winfo_exists():
+            return
+        lognorm = bool(getattr(self, "minimax_lognorm_var", None)
+                       and self.minimax_lognorm_var.get())
+        shift = (minimax_lownoise_to_lognorm_shift(ent.get()) if lognorm
+                 else minimax_lownoise_to_shift(ent.get()))
+        if shift is None:
+            lbl.config(text="✗ enter a number above 0 and below 100", fg="#E74C3C")
+            return
+        # The median is the shift map at the base's median draw — 0.5 for a uniform draw and for
+        # a logit-normal one alike — so it is shift/(shift+1) either way.
+        med = shift / (shift + 1.0)
+        lbl.config(text=f"→ {'logit-normal' if lognorm else 'uniform'} shift {shift:.3g}, "
+                        f"median noise {med:.2f}", fg="#27AE60")
+
+    def _refresh_minimax_blocks_count(self):
+        """Say how many blocks the Blocks to Train box currently means, or why it can't be read.
+
+        A typed spec fails silently in the worst way: "3-12, 4" trains 11 blocks and looks like a
+        run, and nothing downstream ever says otherwise. This turns that into a number you can
+        see before you launch."""
+        lbl = getattr(self, "_minimax_blocks_count", None)
+        combo = self.entries.get("MINIMAX_BLOCKS")
+        if lbl is None or combo is None or not lbl.winfo_exists():
+            return
+        spec = minimax_block_spec(combo.get())
+        if spec.lower() == "all":
+            lbl.config(text="all 50 blocks", fg=COLORS["text_explain"])
+            return
+        try:
+            from fizgig.minimax.trainer import parse_block_spec
+            idx = parse_block_spec(spec, MINIMAX_NUM_BLOCKS)
+        except ValueError as e:
+            lbl.config(text=f"✗ {e}", fg="#E74C3C")
+            return
+        except ImportError:
+            lbl.config(text="")
+            return
+        lbl.config(text=f"✓ {len(idx)} of {MINIMAX_NUM_BLOCKS} blocks", fg="#27AE60")
+
     def _is_krea2_arch(self) -> bool:
         return ARCHITECTURES.get(self.architecture_var.get(), {}).get("is_krea2", False)
+
+    def _is_minimax_arch(self) -> bool:
+        return ARCHITECTURES.get(self.architecture_var.get(), {}).get("is_minimax", False)
 
     def _set_widget_visible(self, w, show: bool):
         """Show/hide a single widget, working for both grid- and pack-managed widgets.
@@ -4426,6 +5952,40 @@ class LoRATrainerGUI:
         # Guard: this may run via update_ui_for_architecture before the Training tab is built.
         if not hasattr(self, "_adaptive_cb"):
             return
+        # MiniMax H3 is a THIRD, even-more-minimal native family. It shares Krea 2's "hide the
+        # Klein-only controls" set, and ALSO hides Krea 2's own extras (base-precision dropdown,
+        # per-image loss watch, torch.compile, LoKR network type) — it's LoRA-over-NF4 only, no
+        # samples. `native` = "not Klein" (hide Klein-only); `is_krea2` still gates the Krea-2-only
+        # widgets, so MiniMax (is_krea2 False) hides them too.
+        is_minimax = self._is_minimax_arch()
+        native = is_krea2 or is_minimax
+
+        # The single-frame preview caveat belongs to MiniMax only — show it under the Base Model
+        # selector when that family is picked, hide it otherwise.
+        _note = getattr(self, "_minimax_sample_note", None)
+        if _note is not None:
+            if is_minimax:
+                if not _note.winfo_manager():
+                    _note.pack(anchor=tk.W, pady=(10, 0))
+            elif _note.winfo_manager():
+                _note.pack_forget()
+
+        # The live-override REFERENCE image is a Klein edit-model feature. Neither native family
+        # is an edit model, and their trainers ignore the field — so hide the picker rather than
+        # leave a control that silently does nothing.
+        for _n in ("_override_ref_browse_btn", "_override_ref_label", "_override_ref_clear_btn"):
+            _w = getattr(self, _n, None)
+            if _w is None:
+                continue
+            if native and _w.winfo_manager():
+                _w.pack_forget()
+            elif not native and not _w.winfo_manager():
+                _w.pack(side=tk.LEFT, **({"padx": (6, 2)} if _n.endswith("label") else {}))
+        if native:
+            try:
+                self.sample_override_ref_var.set("")
+            except Exception:
+                pass
         # Per-widget groups across the Training Parameters + Memory & FP8 sections.
         widgets = [
             self._modelarea_label, self._modelarea_combo, self._modelarea_desc_label,
@@ -4443,7 +6003,7 @@ class LoRATrainerGUI:
             self.labels.get("NETWORK_DROPOUT"), self.entries.get("NETWORK_DROPOUT"),
         ]
         for w in widgets:
-            self._set_widget_visible(w, not is_krea2)
+            self._set_widget_visible(w, not native)
 
         # Base precision is the inverse: Krea 2 ONLY. Its options (Auto / INT8 / NF4 / fp8) and
         # the memory strategy behind them are entirely krea2_train's; Klein's trainer has no
@@ -4456,7 +6016,9 @@ class LoRATrainerGUI:
         # the selector. A name valid for one may not exist in the other (Klein takes module paths;
         # krea2 takes catalog names), so fall back to the shared default rather than carrying a
         # value across that the trainer would then have to reject.
-        self._refresh_optimizer_choices(is_krea2)
+        # MiniMax resolves optimizer names the same catalog-based way Krea 2 does (its trainer
+        # takes catalog names too), so it shares Krea 2's dropdown contents.
+        self._refresh_optimizer_choices(native)
 
         # Krea 2-ONLY controls (inverse of the above): the per-image loss watch toggles are only
         # wired into krea2_train for now — hide them under Klein.
@@ -4464,12 +6026,31 @@ class LoRATrainerGUI:
                   self._krea2_autorecap_cb, self._krea2_warmuplook_cb,
                   self._krea2_losswatch_hint,
                   # torch.compile is wired into krea2_train only.
-                  self._compile_blocks_label, self.compile_blocks_check, self._compile_blocks_hint,
-                  # Network Type (LoRA/LoKR) is a krea2_train flag; Klein trains standard only.
-                  # The row frame carries the combo + hint together.
-                  self.labels["NETWORK_TYPE"], self._network_type_rowf):
+                  self._compile_blocks_label, self.compile_blocks_check, self._compile_blocks_hint):
             self._set_widget_visible(w, is_krea2)
-        if is_krea2:
+        # Network Type (LoRA/LoKR) is wired for BOTH native families (krea2_train and
+        # minimax_train take --network_type/--lokr_factor); Klein trains standard only.
+        # The row frame carries the combo + hint together.
+        for w in (self.labels["NETWORK_TYPE"], self._network_type_rowf):
+            self._set_widget_visible(w, native)
+
+        # Detail Focus is the inverse: MiniMax ONLY. Klein and Krea 2 already derive their shift
+        # from the sample's token count, so there is nothing to dial there.
+        for w in (self._minimax_shift_label, self._minimax_shift_frame, self._minimax_shift_hint,
+                  self._minimax_blocks_label, self._minimax_blocks_frame, self._minimax_blocks_hint,
+                  self._minimax_adaln_cb, self._minimax_adaln_hint,
+                  self._minimax_slow_label, self._minimax_slow_frame, self._minimax_slow_hint,
+                  self._minimax_distill_frame, self._minimax_distill_hint,
+                  self._minimax_quant_label, self._minimax_quant_frame,
+                  self._minimax_quant_hint):
+            self._set_widget_visible(w, is_minimax)
+
+        # Context LoRA is wired for Klein and Krea 2 but NOT MiniMax — hide the whole row there
+        # rather than show a picker the trainer silently ignores.
+        for w in (self._contextlora_label, self._contextlora_frame,
+                  self._contextlora_desc_label, self._contextlora_warn_label):
+            self._set_widget_visible(w, not is_minimax)
+        if native:
             # Restore the rank/alpha <-> factor row swap for the current selection.
             self._on_network_type_changed()
         else:
@@ -4478,10 +6059,10 @@ class LoRATrainerGUI:
             self.show_row("NETWORK_ALPHA")
             self.hide_row("LOKR_FACTOR")
 
-        # Custom block picker: always hidden under Krea 2; under Klein, let the Model-Area
-        # dropdown decide (only shown when the preset is "Custom").
+        # Custom block picker: always hidden under the native families (no Krea 2 / MiniMax block
+        # map); under Klein, let the Model-Area dropdown decide (only shown when preset = "Custom").
         try:
-            if is_krea2:
+            if native:
                 self._training_custom_frame.grid_remove()
             else:
                 self._on_training_preset_changed()
@@ -4493,7 +6074,7 @@ class LoRATrainerGUI:
         # Optimizer section now stays visible for Krea 2 (Gradient Accumulation + Max Grad Norm
         # are wired); its unwired fields are hidden individually above.
         self._set_training_section_visible("optimizer", "scheduler", True)
-        self._set_training_section_visible("timestep", "optimizer", not is_krea2)
+        self._set_training_section_visible("timestep", "optimizer", not native)
 
     # ── Problem Images window (per-image loss watch) ────────────────────
 
@@ -4619,12 +6200,7 @@ class LoRATrainerGUI:
         rows_id = canvas.create_window((0, 0), window=rows, anchor="nw")
         rows.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(rows_id, width=e.width))
-        # Enter/Leave bind_all swapping (the app-wide pattern): a lifetime bind_all would be
-        # silently clobbered the moment the mouse crosses any main-window scrollable frame.
-        _pw_wheel = lambda e: canvas.yview_scroll(-1 * int(e.delta / 120), "units")
-        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _pw_wheel))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
-        win.bind("<Destroy>", lambda e: canvas.unbind_all("<MouseWheel>") if e.widget is win else None)
+        # Wheel: global router (_route_mousewheel) finds this canvas via the pointer.
         self._problem_rows = rows
         self._problem_canvas = canvas
 
@@ -5888,6 +7464,12 @@ class LoRATrainerGUI:
         ttk.Checkbutton(
             settings_card, text="Overwrite existing caption files", variable=self.overwrite_captions_var,
         ).grid(row=6, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
+        tk.Label(settings_card,
+                 text="Untick to caption ONLY images that don't have a .txt yet — e.g. after "
+                      "adding new images or face-cropping, existing captions stay untouched.",
+                 font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"],
+                 bg=COLORS["bg_surface"], wraplength=680, justify=tk.LEFT).grid(
+            row=7, column=0, columnspan=3, sticky=tk.W, pady=(0, 2))
 
         # Card 2: Generate Captions (top-right) — 4 buttons in a 2x2 grid.
         actions_card = self._start_section_card(
@@ -6196,15 +7778,25 @@ class LoRATrainerGUI:
             self.refresh_caption_images()
 
     def show_edit_caption_dialog(self, img_path):
-        """Show dialog to edit caption for an image"""
+        """Live caption editor: no Save button, no confirmation popups. Edits save themselves
+        when you navigate or close; ◀ ▶ (or Ctrl+←/→ — plain arrows stay cursor movement)
+        walk the whole folder without leaving the window. Shaped by user feedback: the old
+        flow was nine clicks per image and people were editing captions in other apps."""
+        folder = os.path.dirname(img_path)
+        from fizgig.dataset.image_dataset import IMAGE_EXTENSIONS
+        _exts = {e.lower() for e in IMAGE_EXTENSIONS}
+        try:
+            files = sorted(f for f in os.listdir(folder)
+                           if os.path.splitext(f)[1].lower() in _exts)
+        except Exception:
+            files = [os.path.basename(img_path)]
+        state = {"path": img_path, "loaded": "", "dirty_grid": False}
+
         dialog = tk.Toplevel(self.master)
-        dialog.title(f"Edit Caption - {os.path.basename(img_path)}")
         dialog.configure(bg=BG_COLOR)
-        # No fixed geometry: content height varies (a portrait thumbnail is up to 300 px tall),
-        # and the old 600x500 clipped the buttons under exactly that case. The dialog sizes to
-        # its content; the button row is packed side=BOTTOM *first*, so pack gives it its space
-        # before anything else and it can never be pushed off the edge.
-        dialog.minsize(600, 360)
+        # No fixed geometry: content height varies (a portrait thumbnail is up to 300 px tall).
+        # The button row packs side=BOTTOM *first* so it can never be clipped off the edge.
+        dialog.minsize(600, 380)
 
         # Find/Replace row — packed at BOTTOM *before* btn_frame so it lands visually
         # BELOW the action buttons (Tk gives the first BOTTOM-packed widget the lowest slot).
@@ -6213,52 +7805,98 @@ class LoRATrainerGUI:
 
         btn_frame = ttk.Frame(dialog)
         btn_frame.pack(side=tk.BOTTOM, pady=10)
+        status = tk.Label(dialog, text="Edits save automatically when you move to another "
+                                       "image or close.", font=(FONT_FAMILY, 9),
+                          fg=COLORS["text_explain"], bg=BG_COLOR)
+        status.pack(side=tk.BOTTOM, pady=(0, 2))
 
-        # Image preview
-        try:
-            with Image.open(img_path) as img:
-                _w, _h = img.size
-                img.thumbnail((300, 300), Image.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-                img_label = ttk.Label(dialog, image=photo)
-                img_label.image = photo
-                img_label.pack(pady=(10, 2))
-                ttk.Label(dialog, text=f"{_w}×{_h} px",
-                          foreground=COLORS["text_muted"]).pack()
-        except Exception:
-            ttk.Label(dialog, text="Could not load image preview").pack(pady=10)
-
-        # Caption text area
+        img_label = ttk.Label(dialog)
+        img_label.pack(pady=(10, 2))
+        size_label = ttk.Label(dialog, foreground=COLORS["text_muted"])
+        size_label.pack()
         ttk.Label(dialog, text="Caption:").pack(anchor=tk.W, padx=10)
-        caption_text = tk.Text(dialog, height=5, width=60, bg=COLORS["bg_surface"], fg=COLORS["text_primary"], font=(FONT_FAMILY, 10), wrap="word")
+        caption_text = tk.Text(dialog, height=5, width=60, bg=COLORS["bg_surface"],
+                               fg=COLORS["text_primary"], font=(FONT_FAMILY, 10), wrap="word",
+                               insertbackground=COLORS["text_primary"])
         caption_text.pack(padx=10, pady=5, fill=tk.X)
 
-        # Load existing caption
-        caption_path = os.path.splitext(img_path)[0] + ".txt"
-        if os.path.exists(caption_path):
-            try:
-                with open(caption_path, 'r', encoding='utf-8') as f:
-                    caption_text.insert("1.0", f.read())
-            except Exception:
-                pass
+        def _cap_path():
+            return os.path.splitext(state["path"])[0] + ".txt"
 
-        def save_caption():
-            text = caption_text.get("1.0", tk.END).strip()
+        def _load(path):
+            state["path"] = path
+            dialog.title(f"Edit Caption — {os.path.basename(path)}"
+                         + (f"   ({files.index(os.path.basename(path)) + 1} / {len(files)})"
+                            if os.path.basename(path) in files else ""))
             try:
-                with open(caption_path, 'w', encoding='utf-8') as f:
+                with Image.open(path) as img:
+                    _w, _h = img.size
+                    img.thumbnail((300, 300), Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    img_label.configure(image=photo)
+                    img_label.image = photo
+                    size_label.configure(text=f"{_w}×{_h} px")
+            except Exception:
+                img_label.configure(image="")
+                img_label.image = None
+                size_label.configure(text="(image preview unavailable)")
+            caption = ""
+            if os.path.exists(_cap_path()):
+                try:
+                    with open(_cap_path(), 'r', encoding='utf-8-sig', errors="replace") as f:
+                        caption = f.read().strip()
+                except Exception:
+                    pass
+            caption_text.delete("1.0", tk.END)
+            caption_text.insert("1.0", caption)
+            state["loaded"] = caption
+
+        def _save():
+            """Write the caption if it changed. Silent and inline — never a popup."""
+            text = caption_text.get("1.0", tk.END).strip()
+            if text == state["loaded"]:
+                return
+            if not text:
+                status.config(fg="#E74C3C",
+                              text="Caption box is empty — not saved (the previous caption "
+                                   "is kept). Type something or move on.")
+                return
+            try:
+                with open(_cap_path(), 'w', encoding='utf-8') as f:
                     f.write(text)
-                messagebox.showinfo("Saved", "Caption saved successfully")
-                self.refresh_caption_images()
+                state["loaded"] = text
+                state["dirty_grid"] = True
+                status.config(fg="#2ECC71", text=f"Saved ✓  {os.path.basename(_cap_path())}")
             except Exception as e:
-                messagebox.showerror("Error", f"Failed to save caption: {e}")
+                status.config(fg="#E74C3C", text=f"Save failed: {e}")
+
+        def _nav(step):
+            _save()
+            base = os.path.basename(state["path"])
+            if base not in files or len(files) < 2:
+                return
+            _load(os.path.join(folder, files[(files.index(base) + step) % len(files)]))
+
+        def _close():
+            _save()
+            if state["dirty_grid"]:
+                self.refresh_caption_images()   # once, on close — not per save (scroll reset)
+            dialog.destroy()
 
         def regenerate():
+            _save()
             dialog.destroy()
-            self.caption_single_image(img_path)
+            self.caption_single_image(state["path"])
 
-        ttk.Button(btn_frame, text="Save", command=save_caption).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Regenerate (AI)", command=regenerate).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="◀ Prev", command=lambda: _nav(-1)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Next ▶", command=lambda: _nav(+1)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Regenerate (AI)", command=regenerate).pack(side=tk.LEFT, padx=(20, 5))
+        ttk.Button(btn_frame, text="Close", command=_close).pack(side=tk.LEFT, padx=5)
+        # Ctrl+arrows so plain arrows keep moving the text cursor while typing.
+        dialog.bind("<Control-Left>", lambda e: (_nav(-1), "break")[1])
+        dialog.bind("<Control-Right>", lambda e: (_nav(+1), "break")[1])
+        dialog.protocol("WM_DELETE_WINDOW", _close)
+        _load(img_path)
 
         def replace_in_caption():
             needle = find_entry.get()
@@ -9865,13 +11503,14 @@ class LoRATrainerGUI:
         # so the layout doesn't jump and users learn they exist).
         opts_row = tk.Frame(mode_card, bg=COLORS["bg_surface"])
         opts_row.pack(anchor=tk.W, pady=(12, 0))
-        ttk.Label(opts_row, text="Max size:").pack(side=tk.LEFT, padx=(0, 4))
-        _max_combo = ttk.Combobox(opts_row, textvariable=self.max_size_var,
-                                  values=["256", "512", "640", "768", "1024", "1280", "1536", "2048"],
+        ttk.Label(opts_row, text="Target megapixels:").pack(side=tk.LEFT, padx=(0, 4))
+        _max_combo = ttk.Combobox(opts_row, textvariable=self.prep_megapixels_var,
+                                  values=["0.25", "0.5", "0.75", "1.0", "1.5", "2.0", "2.4",
+                                          "3.0", "4.2"],
                                   state="readonly", width=6)
         _max_combo.pack(side=tk.LEFT)
         _max_combo.bind("<<ComboboxSelected>>", lambda e: self._update_prep_note())
-        tk.Label(opts_row, text="px  (larger images shrink to fit; smaller are left alone)",
+        tk.Label(opts_row, text="MP  (larger images shrink to fit; smaller are left alone)",
                  font=(FONT_FAMILY, 9), fg=COLORS["text_muted"], bg=COLORS["bg_surface"]).pack(
             side=tk.LEFT, padx=(4, 16))
         self._face_target_label = ttk.Label(opts_row, text="Face:")
@@ -9898,6 +11537,24 @@ class LoRATrainerGUI:
             self._face_unavail_label.pack(side=tk.LEFT, padx=(8, 0))
         else:
             self._face_unavail_label = None
+
+        # Why this is megapixels and not a "max size" any more. Training picks its resolution by
+        # AREA, so a longest-edge cap quietly shrank every non-square image below the training
+        # target — a 3:4 photo kept only 75% of the pixels it could have trained at, 16:9 just 56%.
+        tk.Label(mode_card,
+                 text="Sizing is by target area (megapixels), not longest side — this matches how "
+                      "training buckets your images, so prepping no longer costs you resolution. "
+                      "Aspect ratio is preserved; nothing is cropped.",
+                 font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+                 wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(8, 0))
+        # Only shown when prep is set BELOW the Training tab's target — the one harmful direction
+        # (prepping higher is free: training simply downscales at cache time).
+        self._prep_mp_warn_var = tk.StringVar(value="")
+        self._prep_mp_warn_label = tk.Label(
+            mode_card, textvariable=self._prep_mp_warn_var,
+            font=(FONT_FAMILY, 9), fg=COLORS["warning"], bg=COLORS["bg_surface"],
+            wraplength=760, justify=tk.LEFT)
+        # packed/unpacked by _update_prep_note
 
         # Card 3: Your originals — the one real destination question, as an explicit choice
         # (replaces the old inverted "Replace originals" checkbox). Keep-safe is the default.
@@ -10023,31 +11680,35 @@ class LoRATrainerGUI:
         self._update_prep_note()
 
     def _prep_source_stats(self, max_sample=40):
-        """(image_count, median_longest_edge) for the training folder's top-level images.
+        """(image_count, median_area_px, median_size) for the training folder's top-level images.
 
-        Edge read from image HEADERS only (PIL .size — no pixel decode), sampled at most
+        AREA rather than longest edge, because that's what both prep and training size by.
+        Read from image HEADERS only (PIL .size — no pixel decode), sampled at most
         `max_sample` files, so it's cheap enough to run on every settings change. Returns
-        (0, None) when the folder is unset/empty."""
+        (0, None, None) when the folder is unset/empty."""
         folder = self.image_folder_var.get().strip()
         exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
         try:
             files = [os.path.join(folder, f) for f in os.listdir(folder)
                      if os.path.splitext(f)[1].lower() in exts]
         except OSError:
-            return 0, None
-        edges = []
+            return 0, None, None
+        sizes = []
         for p in files[:max_sample]:
             try:
                 with Image.open(p) as im:
-                    edges.append(max(im.size))
+                    sizes.append(im.size)
             except Exception:
                 pass
-        median = sorted(edges)[len(edges) // 2] if edges else None
-        return len(files), median
+        if not sizes:
+            return len(files), None, None
+        sizes.sort(key=lambda wh: wh[0] * wh[1])
+        median_size = sizes[len(sizes) // 2]
+        return len(files), median_size[0] * median_size[1], median_size
 
     def _update_prep_note(self, *args):
         """The 'What will happen' summary — computed from ALL the settings (mode, originals
-        choice, max size, live folder contents). The one-line note this replaces ignored the
+        choice, target megapixels, live folder contents). The one-line note this replaces ignored the
         output folder entirely and taught users the wrong answer to 'does this touch my
         folder?'."""
         if not hasattr(self, '_prep_note_var'):
@@ -10055,20 +11716,29 @@ class LoRATrainerGUI:
         mode = self.prep_mode_var.get()
         replace = self.delete_originals_var.get()
         try:
-            max_px = int(self.max_size_var.get())
+            prep_mp = float(self.prep_megapixels_var.get())
         except (ValueError, tk.TclError):
-            max_px = 1024
-        n, median_edge = self._prep_source_stats()
+            prep_mp = 1.0
+        target_area = self._prep_target_area(prep_mp)
+        n, median_area, median_size = self._prep_source_stats()
+
+        # A worked example in the user's own aspect ratio, so "1.0 MP" is a concrete size.
+        example = ""
+        if median_size:
+            _w, _h = self._prep_output_size(median_size, target_area)
+            if (_w, _h) != tuple(median_size):
+                example = f" (your typical {median_size[0]}×{median_size[1]} → {_w}×{_h})"
 
         count = f"your {n} images" if n else "your images"
+        sized = f"resized to about {prep_mp:g} MP{example} and saved as PNG"
         if mode == "Auto Prep (Face Crops)":
-            what = (f"{count} → resized to fit {max_px} px and saved as PNG, plus one face "
+            what = (f"{count} → {sized}, plus one face "
                     f"close-up each{f' (≈{n * 2} files)' if n else ''}")
         elif mode == "Face Crop Only":
             what = (f"{count} → replaced by just the cropped face from each photo, "
                     f"saved as PNG")
         else:
-            what = f"{count} → resized to fit {max_px} px and saved as PNG"
+            what = f"{count} → {sized}"
 
         where = "Everything lands in your training folder."
         if replace:
@@ -10079,15 +11749,34 @@ class LoRATrainerGUI:
 
         lines = [f"{what}. {where} {originals}"]
         # Soft-crop warning: face modes cropping from images that are already training-size
-        # produce small, blurry faces. Header-read median across a sample of the folder.
-        if mode != "Resize Only" and median_edge is not None and median_edge <= max_px:
-            lines.append(f"⚠ Your images are already ≤ {max_px} px — face "
+        # produce small, blurry faces. Header-read median AREA across a sample of the folder.
+        if mode != "Resize Only" and median_area is not None and median_area <= target_area:
+            lines.append(f"⚠ Your images are already at or below {prep_mp:g} MP — face "
                          f"close-ups cut from them will be soft. If you have higher-res "
                          f"versions, prep from those instead.")
         if mode != "Resize Only":
             lines.append("Next: eyeball the face close-ups on the Captions tab and Remove any "
                          "blurry ones before captioning.")
         self._prep_note_var.set("\n".join(lines))
+
+        # Prep BELOW the training target is the one harmful direction: training never upscales,
+        # so those pixels are gone for good. Prepping higher is free — training just downscales.
+        if hasattr(self, "_prep_mp_warn_label"):
+            try:
+                train_mp = float(self.dataset_megapixels_var.get())
+            except (ValueError, tk.TclError):
+                train_mp = prep_mp
+            if prep_mp < train_mp:
+                self._prep_mp_warn_var.set(
+                    f"⚠ Training is set to {train_mp:g} MP but prep is set to {prep_mp:g} MP — "
+                    f"your images would be shrunk below what training asks for, and training "
+                    f"cannot get that detail back. Match them, or prep higher.")
+                if not self._prep_mp_warn_label.winfo_manager():
+                    self._prep_mp_warn_label.pack(anchor=tk.W, pady=(4, 0))
+            else:
+                self._prep_mp_warn_var.set("")
+                if self._prep_mp_warn_label.winfo_manager():
+                    self._prep_mp_warn_label.pack_forget()
 
         # The Run button carries the live count — "Prepare 34 Images Now" answers "run on what?"
         if hasattr(self, "prepare_images_btn"):
@@ -10297,11 +11986,7 @@ class LoRATrainerGUI:
         rows_id = canvas.create_window((0, 0), window=rows, anchor="nw")
         rows.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(rows_id, width=e.width))
-        # Enter/Leave bind_all swapping (the app-wide pattern — see Problem Images window).
-        _ff_wheel = lambda e: canvas.yview_scroll(-1 * int(e.delta / 120), "units")
-        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _ff_wheel))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
-        win.bind("<Destroy>", lambda e: canvas.unbind_all("<MouseWheel>") if e.widget is win else None)
+        # Wheel: global router (_route_mousewheel) finds this canvas via the pointer.
         self._ff_rows = rows
 
     def _ff_set_status(self, text):
@@ -10676,8 +12361,29 @@ class LoRATrainerGUI:
                   f"writing {os.path.basename(candidate)} instead\n")
         return candidate
 
+    def _stash_original_if_inplace(self, filepath, output_path, output_folder, replace_originals):
+        """Call BEFORE saving. Keep-safe mode + in-place PNG output means the save OVERWRITES
+        the original — by the time _handle_original ran, there was nothing left to move
+        (issue #43: PNG originals silently destroyed while JPGs were kept). A COPY rather
+        than a move, because PIL may still hold the source file open at this point and a
+        move of an open file fails on Windows; the end state is identical — original
+        content in originals/, processed image at the original name."""
+        if replace_originals or filepath != output_path or not os.path.exists(filepath):
+            return
+        if not hasattr(self, '_originals_dir_cache'):
+            self._originals_dir_cache = {}
+        if output_folder not in self._originals_dir_cache:
+            self._originals_dir_cache[output_folder] = self._get_originals_dir(output_folder)
+        originals_dir = self._originals_dir_cache[output_folder]
+        os.makedirs(originals_dir, exist_ok=True)
+        import shutil
+        shutil.copy2(filepath, os.path.join(originals_dir, os.path.basename(filepath)))
+
     def _handle_original(self, filepath, output_path, output_folder, replace_originals):
-        """Handle the original file: delete if replacing, move to subfolder if preserving."""
+        """Handle the original file: delete if replacing, move to subfolder if preserving.
+        The in-place keep-safe case is covered by _stash_original_if_inplace BEFORE the save
+        — by this point the overwrite has already happened, correctly for replace mode and
+        harmlessly for keep-safe (the original is already copied out)."""
         if filepath == output_path:
             return  # Output overwrote original, nothing to do
         if replace_originals:
@@ -10737,18 +12443,67 @@ class LoRATrainerGUI:
             img = img.convert('RGB')
         return img
 
-    def _resize_image(self, img, max_size):
-        """Resize image maintaining aspect ratio. Never upscales. Returns (img, resized_bool)."""
+    @staticmethod
+    def _bucket_step():
+        """The resolution grid training buckets on (RESOLUTION_STEPS). Read from the dataset
+        module so prep and bucketing can never drift apart; 16 if the import isn't available."""
+        try:
+            import sys as _sys
+            _src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
+            if _src not in _sys.path:
+                _sys.path.insert(0, _src)
+            from fizgig.dataset.image_dataset import RESOLUTION_STEPS
+            return int(RESOLUTION_STEPS)
+        except Exception:
+            return 16
+
+    def _prep_target_area(self, mp):
+        """Training's real target AREA for a megapixel setting.
+
+        Derived exactly as the dataset TOML writer derives `resolution` — floor the square side
+        to the bucket grid (1.0 MP -> 992x992 = 984 064 px, not 1 000 000). Matching it means
+        prep lands at or just UNDER what training asks for, which keeps training's no-upscale
+        path: the cache step then resamples and crops nothing at all."""
+        step = self._bucket_step()
+        side = max(step, int(math.sqrt(max(0.0, mp) * 1_000_000)) // step * step)
+        return side * side
+
+    def _prep_output_size(self, size, target_area):
+        """The (w, h) `_resize_image` would produce for `size` — same maths, no pixels touched.
+        Used by the summary card to show a worked example before anything is written."""
+        width, height = size
+        cur_area = width * height
+        if cur_area <= target_area:
+            return width, height
+        step = self._bucket_step()
+        scale = math.sqrt(target_area / cur_area)
+        return (max(step, int(width * scale) // step * step),
+                max(step, int(height * scale) // step * step))
+
+    def _resize_image(self, img, target_area):
+        """Resize to ~`target_area` PIXELS, preserving aspect ratio. Never upscales.
+        Returns (img, resized_bool).
+
+        Area, not longest edge: training chooses its resolution by area and — with No Upscale on,
+        the default — leaves any image already at or under the target exactly as it is. A
+        longest-edge cap therefore pushed every non-square image permanently below the training
+        target (a 3:4 photo trained at 75% of the pixels it could have, 16:9 at 56%; issue #44).
+
+        Both sides are floored to the bucket step (16). Training floors to that grid anyway, so
+        doing it here makes the saved file exactly what trains, and lands just under the target
+        area — which keeps training's no-upscale path and means the cache step resamples and
+        crops nothing at all."""
         width, height = img.size
-        if width > max_size or height > max_size:
-            if width > height:
-                new_width = max_size
-                new_height = int(height * (max_size / width))
-            else:
-                new_height = max_size
-                new_width = int(width * (max_size / height))
-            return img.resize((new_width, new_height), Image.LANCZOS), True
-        return img, False
+        cur_area = width * height
+        if cur_area <= target_area:
+            return img, False                      # never upscale — it would only invent detail
+        step = self._bucket_step()
+        scale = math.sqrt(target_area / cur_area)
+        new_width = max(step, int(width * scale) // step * step)
+        new_height = max(step, int(height * scale) // step * step)
+        if (new_width, new_height) == (width, height):
+            return img, False
+        return img.resize((new_width, new_height), Image.LANCZOS), True
 
     def _select_face(self, faces, face_mode):
         """Select a face from detected faces based on face_mode. Returns (FaceInfo, note_str) or (None, note_str)."""
@@ -10942,7 +12697,11 @@ class LoRATrainerGUI:
         self._originals_dir_cache = {}  # Reset per run
         source_folder = self.image_folder_var.get()
         output_folder = self.convert_output_var.get() or source_folder
-        max_size = int(self.max_size_var.get())
+        # Target AREA in pixels, from the megapixel selector (see _resize_image for why area).
+        try:
+            target_area = self._prep_target_area(float(self.prep_megapixels_var.get()))
+        except (ValueError, tk.TclError):
+            target_area = self._prep_target_area(1.0)
         replace_originals = self.delete_originals_var.get()
         prep_mode = self.prep_mode_var.get()
         face_mode = self._get_face_selection_mode()
@@ -10971,16 +12730,16 @@ class LoRATrainerGUI:
         self.convert_log.delete(1.0, tk.END)
 
         if prep_mode == "Auto Prep (Face Crops)":
-            self._auto_prep_images(source_folder, output_folder, max_size, face_mode, face_padding, replace_originals)
+            self._auto_prep_images(source_folder, output_folder, target_area, face_mode, face_padding, replace_originals)
         elif prep_mode == "Resize Only":
-            self._resize_only_images(source_folder, output_folder, max_size, replace_originals)
+            self._resize_only_images(source_folder, output_folder, target_area, replace_originals)
         elif prep_mode == "Face Crop Only":
-            self._face_crop_only_images(source_folder, output_folder, max_size, face_mode, face_padding, replace_originals)
+            self._face_crop_only_images(source_folder, output_folder, target_area, face_mode, face_padding, replace_originals)
 
         self.convert_log.configure(state="disabled")
         self.convert_log.see(tk.END)
 
-    def _resize_only_images(self, source_folder, output_folder, max_size, replace_originals):
+    def _resize_only_images(self, source_folder, output_folder, target_area, replace_originals):
         """Resize Only mode: convert/resize images, no face detection."""
         self._log("Mode: Resize Only\n\n")
         files = self._get_image_files(source_folder)
@@ -10992,7 +12751,7 @@ class LoRATrainerGUI:
             try:
                 img = self._load_image(filepath)
                 original_size = img.size
-                img, resized = self._resize_image(img, max_size)
+                img, resized = self._resize_image(img, target_area)
                 w, h = img.size
 
                 base_name = os.path.splitext(filename)[0]
@@ -11005,6 +12764,7 @@ class LoRATrainerGUI:
                     continue
 
                 output_path = self._safe_output_path(filepath, output_path)
+                self._stash_original_if_inplace(filepath, output_path, output_folder, replace_originals)
                 self._atomic_png_save(img, output_path)
                 size_info = f"{original_size[0]}x{original_size[1]} -> {w}x{h}" if resized else f"{w}x{h}"
                 self._log(f"Converted: {filename} [{size_info}]\n")
@@ -11019,7 +12779,7 @@ class LoRATrainerGUI:
 
         self._log(f"\n--- Summary ---\nConverted: {converted} | Skipped: {skipped} | Errors: {errors}\n")
 
-    def _face_crop_only_images(self, source_folder, output_folder, max_size, face_mode, face_padding, replace_originals):
+    def _face_crop_only_images(self, source_folder, output_folder, target_area, face_mode, face_padding, replace_originals):
         """Face Crop Only mode: face crop replaces the output."""
         self._log(f"Mode: Face Crop Only ({face_mode}, padding {face_padding}%)\n\n")
         files = self._get_image_files(source_folder)
@@ -11051,7 +12811,7 @@ class LoRATrainerGUI:
                 except Exception as fe:
                     self._log(f"  Face error ({filename}): {fe}\n")
 
-                img, resized = self._resize_image(img, max_size)
+                img, resized = self._resize_image(img, target_area)
                 w, h = img.size
 
                 base_name = os.path.splitext(filename)[0]
@@ -11064,6 +12824,7 @@ class LoRATrainerGUI:
                     continue
 
                 output_path = self._safe_output_path(filepath, output_path)
+                self._stash_original_if_inplace(filepath, output_path, output_folder, replace_originals)
                 self._atomic_png_save(img, output_path)
                 size_info = f"{original_size[0]}x{original_size[1]} -> {w}x{h}" if (resized or cropped) else f"{w}x{h}"
                 self._log(f"Converted: {filename} [{size_info}]{crop_info}\n")
@@ -11079,7 +12840,7 @@ class LoRATrainerGUI:
         self._log(f"\n--- Summary ---\nConverted: {converted} | Skipped: {skipped} | Errors: {errors}\n")
         self._log(f"Face crops: {face_crops} | No face: {no_face}\n")
 
-    def _auto_prep_images(self, source_folder, output_folder, max_size, face_mode, face_padding, replace_originals):
+    def _auto_prep_images(self, source_folder, output_folder, target_area, face_mode, face_padding, replace_originals):
         """Auto Prep mode: resize originals + generate face crops from the HIGH-RES original
         (before it gets overwritten/moved), then handle originals."""
         self._log(f"Mode: Auto Prep (Face Crops)\n")
@@ -11116,7 +12877,7 @@ class LoRATrainerGUI:
                             self._log(note)
                         if selected:
                             cropped = crop_to_face(original_img, selected, face_padding)
-                            cropped, _ = self._resize_image(cropped, max_size)
+                            cropped, _ = self._resize_image(cropped, target_area)
                             crop_name = f"FaceCrop_{crop_index:03d}.png"
                             crop_path = os.path.join(output_folder, crop_name)
                             cropped.save(crop_path, "PNG")
@@ -11134,7 +12895,7 @@ class LoRATrainerGUI:
                     self._log(f"Face crop error ({filename}): {e}\n")
 
                 # --- Resize and save the main image ---
-                resized_img, resized = self._resize_image(original_img, max_size)
+                resized_img, resized = self._resize_image(original_img, target_area)
                 w, h = resized_img.size
                 output_path = os.path.join(output_folder, base_name + ".png")
 
@@ -11145,6 +12906,10 @@ class LoRATrainerGUI:
                     continue
 
                 output_path = self._safe_output_path(filepath, output_path)
+                # Keep-safe + in-place PNG means this save OVERWRITES the original and
+                # _handle_original below has nothing left to move — the issue #43 failure, which
+                # was fixed in the other two modes but not here, i.e. in the DEFAULT one.
+                self._stash_original_if_inplace(filepath, output_path, output_folder, replace_originals)
                 self._atomic_png_save(resized_img, output_path)
                 size_info = f"{original_size[0]}x{original_size[1]} -> {w}x{h}" if resized else f"{w}x{h}"
                 self._log(f"Converted: {filename} [{size_info}]\n")
@@ -13710,6 +15475,67 @@ class LoRATrainerGUI:
 
         self._add_runpod_card(outer)
 
+        # Card (bottom): MiniMax H3 model paths — experimental third family, kept at the very
+        # bottom under everything else since it's barebones image-only LoRA training (no samples,
+        # no inference). The DiT is the training base; it's NF4-quantized at load either way.
+        mm_card = self._start_section_card(
+            outer, "Model Paths (MiniMax H3 — experimental)",
+            "Image-only LoRA training for MiniMax's ~33B H3 omni DiT. Train on the pruned int8 DiT "
+            "— the same file ComfyUI runs — quantized to NF4 at load, so the resident base is "
+            "~11 GB. The Qwen3-VL-32B text encoder and the video VAE are only needed for the "
+            "one-time caching pass; the compact nvfp4 TE is recommended. Stills only — no video, "
+            "no audio.",
+        )
+        mm_card.columnconfigure(1, weight=1)
+        mr = 0
+        mr = self._add_pref_row(
+            mm_card, mr, "DiT:", "minimax_dit",
+            "MiniMax H3 DiT — the training base. Use the PRUNED int8 file "
+            "(minimax_h3_fl2va_pruned_int8_convrot.safetensors, ~21 GB): it is the one ComfyUI "
+            "runs, so your LoRA trains against the weights it will be deployed on, and its "
+            "curve-table AdaLN is a target a LoRA can actually use. The ~66 GB bf16 file also "
+            "works. The pruned file KEEPS its int8 weights (~21 GB on the GPU, what the reference "
+            "trainer does); the bf16 file is quantized to NF4 at load (~11 GB, a little lossier).",
+            download_url="https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            download_note="~21GB — Comfy-Org/MiniMax-H3 → diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors (fl2va is the trainable variant; the 66GB bf16 file works too)",
+        )
+        mr = self._add_pref_row(
+            mm_card, mr, "DiT (reference):", "minimax_ref_dit",
+            "OPTIONAL — only for reference distillation ('Learn identity from' on the Training "
+            "tab). This is the ref2va model, a DIFFERENT fine-tune from the fl2va one above and "
+            "not just another quantization of it: it is what ComfyUI's Reference-to-Video "
+            "workflow loads, and the only H3 build that accepts reference images. A LoRA "
+            "distilled this way is trained on it and runs on it. Leave blank for ordinary "
+            "training.",
+            download_url="https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+            download_note="~21GB — Comfy-Org/MiniMax-H3 -> diffusion_models/"
+                          "minimax_h3_ref2va_pruned_int8_convrot.safetensors (the pruned int8 "
+                          "build, same shape as the fl2va one above; you may already have it if "
+                          "you use the r2v workflow)",
+        )
+        mr = self._add_pref_row(
+            mm_card, mr, "Qwen3-VL-32B TE:", "minimax_text_encoder",
+            "Qwen3-VL-32B text encoder — nvfp4 (the compact ComfyUI file) or bf16 both work; the "
+            "loader detects which you gave it. The nvfp4 file keeps its packed weights (~15.7 GB "
+            "on the GPU); bf16 is NF4-quantized at load (~14 GB). Used only while caching caption "
+            "embeddings, then offloaded before training. (The int8_convrot TE "
+            "variant is NOT supported — its rotated weights can't be dequantized here.)",
+            download_url="https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+            download_label="Download nvfp4 (recommended)",
+            download_note="~15.7GB nvfp4-awq — the same TE ComfyUI uses, so you may already have it; "
+                          "identical conditioning to bf16 (validated), just a slower one-off load",
+            download_url2="https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors",
+            download_label2="bf16",
+            download_note2="~51.5GB bf16 — the full-precision original; loads faster, 3.3x the disk",
+        )
+        mr = self._add_pref_row(
+            mm_card, mr, "Video VAE:", "minimax_vae",
+            "The H3 video VAE — encodes each training image to a 24-channel latent (used only "
+            "during caching).",
+            download_url="https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/vae/minimax_h3_video_vae_fp16.safetensors",
+            download_note="~4.9GB — Comfy-Org/MiniMax-H3 → vae/minimax_h3_video_vae_fp16.safetensors",
+        )
+
         # Card 4: Actions
         actions_card = self._start_section_card(outer, "Actions", None)
         action_row = tk.Frame(actions_card, bg=COLORS["bg_surface"])
@@ -14966,10 +16792,7 @@ class LoRATrainerGUI:
             self._schedule_repair_preview_redraws()
         outer_canvas.bind("<Configure>", _on_canvas_config)
 
-        def _on_wheel(e):
-            outer_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        outer_canvas.bind("<Enter>", lambda e: outer_canvas.bind_all("<MouseWheel>", _on_wheel))
-        outer_canvas.bind("<Leave>", lambda e: outer_canvas.unbind_all("<MouseWheel>"))
+        # Wheel: global router (_route_mousewheel) finds this canvas via the pointer.
 
         self.repair_outer_canvas = outer_canvas
         return inner
@@ -15445,11 +17268,7 @@ class LoRATrainerGUI:
             canvas.itemconfigure(inner_id, width=e.width)
         canvas.bind("<Configure>", _on_canvas_config)
 
-        # Mousewheel scrolling when hovering the panel
-        def _on_mousewheel(e):
-            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        # Wheel: global router (_route_mousewheel) finds this canvas via the pointer.
 
         inner.columnconfigure(0, weight=1)
         inner.columnconfigure(1, weight=1)
@@ -15497,10 +17316,7 @@ class LoRATrainerGUI:
         inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(inner_id, width=e.width))
 
-        def _on_mousewheel(e):
-            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        # Wheel: global router (_route_mousewheel) finds this canvas via the pointer.
 
         inner.columnconfigure(0, weight=1)
         inner.columnconfigure(1, weight=1)
@@ -17110,6 +18926,10 @@ class LoRATrainerGUI:
         eng.load_primary(path)
 
     def _royale_unload(self):
+        # Same internal guard as the Repair/Explorer unloads: resetting under a live CUDA
+        # worker hard-hangs, and callers (tab switch, pre-training hygiene) can't know.
+        if self._royale_is_busy():
+            return
         if getattr(self, "royale_engine", None) is not None:
             try:
                 self.royale_engine.reset()
@@ -19536,6 +21356,14 @@ class LoRATrainerGUI:
                                   for c in os.path.basename(_cache_img_dir.rstrip("/\\"))) or "dataset"
                     cache_dir = os.path.join(cache_dir, f"{_nm}-{_h}")
 
+            # MiniMax uses ONE dataset at the Target Megapixels you set, exactly like Klein and
+            # Krea 2. It briefly mirrored ai-toolkit's resolution: [512, 768, 1024], which copies
+            # the dataset once per scale — every image trained three times per epoch. Dropped
+            # (Peter, 4 Aug): with a bucketed dataset the scale variation is already there, and
+            # tripling exposure to the same images per epoch is a much better way to overfit than
+            # to teach scale invariance — most of all on tight face crops, where the extra copies
+            # add no compositional diversity at all. It also silently tripled the work behind the
+            # Epochs box, so "50 epochs" stopped meaning what it used to.
             if is_jsonl:
                 jsonl_file = self.dataset_jsonl_file_var.get().strip().replace("\\", "/")
                 if is_video:
@@ -19722,6 +21550,32 @@ class LoRATrainerGUI:
         _check_num("Network Alpha", self.entries["NETWORK_ALPHA"].get(), float, 0)
         if self._network_type_is_lokr():
             _check_num("LoKR Factor", self.entries["LOKR_FACTOR"].get(), int, 2)
+        # Blocks to Train is free text, so a typo is caught HERE rather than after the 21 GB base
+        # has streamed in — and a queued run must never fail an hour later on a bad spec.
+        if self._is_minimax_arch():
+            _spec = minimax_block_spec(self.entries["MINIMAX_BLOCKS"].get())
+            if _spec.lower() != "all":
+                try:
+                    from fizgig.minimax.trainer import parse_block_spec
+                    parse_block_spec(_spec, MINIMAX_NUM_BLOCKS)
+                except ValueError as e:
+                    errors.append(f"Blocks to Train: {e}")
+                except ImportError:
+                    pass
+            if minimax_lownoise_to_shift(self.entries["MINIMAX_LOWNOISE_PCT"].get()) is None:
+                errors.append("Low-noise training must be a number above 0 and below 100 "
+                              f"(got {self.entries['MINIMAX_LOWNOISE_PCT'].get()!r})")
+            _slow_spec = str(self.entries["MINIMAX_SLOW_BLOCKS"].get() or "").strip()
+            if _slow_spec:
+                try:
+                    from fizgig.minimax.trainer import parse_block_spec
+                    parse_block_spec(_slow_spec, MINIMAX_NUM_BLOCKS)
+                except ValueError as e:
+                    errors.append(f"Slower LR for blocks: {e}")
+                except ImportError:
+                    pass
+                _check_num("Slower LR multiplier",
+                           self.entries["MINIMAX_SLOW_LR_SCALE"].get(), float, 0)
         _check_num("Max Train Epochs", self.entries["MAX_TRAIN_EPOCHS"].get(), int, 1)
         _check_num("Save Every N Epochs", self.entries["SAVE_EVERY_N_EPOCHS"].get(), int, 1)
         _check_num("Seed", self.entries["SEED"].get(), int)
@@ -19740,7 +21594,28 @@ class LoRATrainerGUI:
         elif not os.path.exists(dataset_config):
             errors.append(f"Dataset config file does not exist: {dataset_config}")
 
-        if config.get("is_krea2"):
+        if config.get("is_minimax"):
+            # MiniMax H3 reads its three model paths from Preferences (minimax_*). All are
+            # required: the DiT to train (pruned int8 or bf16), the video VAE + Qwen3-VL-32B TE.
+            for pref_key, label in (
+                ("minimax_dit", "MiniMax H3 DiT"),
+                ("minimax_vae", "MiniMax H3 Video VAE"),
+                ("minimax_text_encoder", "Qwen3-VL-32B text encoder"),
+            ):
+                path = self._krea2_pref(pref_key)
+                if not path:
+                    errors.append(f"{label} path is empty (set it on the Preferences tab)")
+                elif not os.path.exists(path):
+                    errors.append(f"{label} file does not exist: {path}")
+            # Reference distillation needs the ref2va model and a real reference photo.
+            if getattr(self, "minimax_distill_var", None) and self.minimax_distill_var.get():
+                if not self._krea2_pref("minimax_ref_dit"):
+                    errors.append("Reference distillation needs the ref2va DiT — set "
+                                  "'DiT (reference)' on the Preferences tab. It is a different "
+                                  "model from the one above and the only H3 build that takes "
+                                  "reference images.")
+                _check_num("References each", self.entries["MINIMAX_DISTILL_REFS"].get(), int, 1)
+        elif config.get("is_krea2"):
             # Krea 2 reads its own four model paths from Preferences (krea2_*). The
             # Turbo DiT is only required when in-training previews are enabled.
             krea2_required = [
@@ -19885,6 +21760,11 @@ class LoRATrainerGUI:
         # Check caption files exist in the dataset folder
         image_dir = self.image_folder_var.get().strip()
         caption_ext = self.dataset_caption_ext_var.get().strip()
+        # A SET folder that no longer exists is an error, not a skip: the TOML regenerator
+        # early-returns on a missing folder, so proceeding trains whatever dataset the TOML
+        # last pointed at — silently, under this run's name.
+        if image_dir and not os.path.isdir(image_dir):
+            errors.append(f"Training image folder does not exist: {image_dir}")
         if image_dir and os.path.isdir(image_dir) and caption_ext:
             import glob as _glob
             # glob.escape is load-bearing here: a folder like "[subject] photos" made this
@@ -19903,6 +21783,23 @@ class LoRATrainerGUI:
             return False
 
         return True
+
+    @staticmethod
+    def _pipeline_exit_routes_to_state_machine(name, returncode):
+        """Which subprocess exits the pause/queue state machine must hear about.
+
+        Training exits: always (clean finish, failure, stop, pause all carry state).
+        Caching phases ("Cache Preparation" / "Text Encoder Caching"): only NONZERO exits —
+        a clean cache exit continues the pipeline via its callback and the run is still
+        alive. Before this predicate existed, a failed or stopped caching phase left
+        training_state stranded at "running" with no process: the Start button read
+        "Queue Train" but launched, Pause pointed at nothing, the queue window pinned a
+        dead run, and a queued job that died in caching vanished without the HELD notice.
+        """
+        n = (name or "").lower()
+        if "training" in n:
+            return True
+        return "cach" in n and returncode != 0
 
     def run_subprocess(self, cmd, name, callback=None):
         """Run a subprocess and handle its output with UTF-8 encoding"""
@@ -19955,8 +21852,9 @@ class LoRATrainerGUI:
             process.wait()
             self.master.after(0, self.update_console, f"{name} process completed.\n")
             self.current_process = None
-            # Route training-subprocess exit through the pause/resume state machine
-            if name and "training" in name.lower():
+            # Route pipeline exits through the pause/resume state machine (see the predicate
+            # for which ones — a dead caching phase used to strand the app in "running").
+            if self._pipeline_exit_routes_to_state_machine(name, process.returncode):
                 self.master.after(0, self._on_training_subprocess_exited, process.returncode)
             if process.returncode != 0:
                 self.master.after(0, self.update_console,
@@ -19979,11 +21877,9 @@ class LoRATrainerGUI:
         _proc = getattr(self, "current_process", None)
         try:
             if _proc is not None and _proc.poll() is None:
-                messagebox.showinfo(
-                    "Already Running",
-                    "A training/caching run is already active.\n\n"
-                    "Stop it (or let it finish) before starting another."
-                )
+                # A run is active, so Start means QUEUE: capture the currently configured
+                # run and append it. (The button already reads "Queue Train" in this state.)
+                self._queue_current_run()
                 return
         except Exception:
             pass
@@ -20036,10 +21932,23 @@ class LoRATrainerGUI:
 
         # Snapshot current settings for the "Load Last Train" button
         self._save_last_train_settings()
+        # ...and as the queue window's pinned "training now" card: editing a queued job loads
+        # its settings into this tab, so the window needs a way back to the run in progress.
+        self._active_run_item = self._queue_snapshot()
 
         # Unload Florence model to free VRAM before training
         if self.florence_model is not None:
             self.unload_florence_model(silent=True)
+        # ...and the tool-tab engines (Repair Studio / Explorer / Royale, 10-20 GB each).
+        # A manual Start implies a switch to the Training tab, which unloads them via
+        # on_tab_changed — but a queue auto-advance or the queue window's "Start next now"
+        # involves NO tab switch, and training would otherwise launch against a full card.
+        # All three are idle-guarded internally, so this is safe and idempotent.
+        for _unl in ("_unload_repair_studio_models", "_unload_explorer_models", "_royale_unload"):
+            try:
+                getattr(self, _unl)()
+            except Exception:
+                pass
 
         # Start samples watcher for live gallery updates
         if self.sample_enabled_var.get():
@@ -20071,17 +21980,24 @@ class LoRATrainerGUI:
         # Validate blocks swap
         try:
             is_auto = self.entries["BLOCKS_SWAP"].get().strip().lower().startswith("auto")
-            blocks_swap = self._parse_blocks_swap()
-            if is_auto:
-                self.update_console(f"Block Swap: Auto detected → {blocks_swap} (based on GPU VRAM)\n")
-            if blocks_swap > config["blocks_swap_max"]:
-                messagebox.showwarning(
-                    "Warning",
-                    f"Blocks Swap value ({blocks_swap}) exceeds maximum for {arch} ({config['blocks_swap_max']}). Using maximum value."
-                )
-                blocks_swap = config["blocks_swap_max"]
-                self.entries["BLOCKS_SWAP"].delete(0, tk.END)
-                self.entries["BLOCKS_SWAP"].insert(0, str(blocks_swap))
+            if config.get("is_minimax") and is_auto:
+                # MiniMax resolves "auto" in the TRAINER from real free VRAM at run time (correct
+                # for queued runs too) — the Klein/Krea2 tier tables here don't fit its NF4 base.
+                blocks_swap = "auto"
+                self.update_console("Block Swap: Auto — the trainer plans swap + checkpointing "
+                                    "from free VRAM at launch\n")
+            else:
+                blocks_swap = self._parse_blocks_swap()
+                if is_auto:
+                    self.update_console(f"Block Swap: Auto detected → {blocks_swap} (based on GPU VRAM)\n")
+                if blocks_swap > config["blocks_swap_max"]:
+                    messagebox.showwarning(
+                        "Warning",
+                        f"Blocks Swap value ({blocks_swap}) exceeds maximum for {arch} ({config['blocks_swap_max']}). Using maximum value."
+                    )
+                    blocks_swap = config["blocks_swap_max"]
+                    self.entries["BLOCKS_SWAP"].delete(0, tk.END)
+                    self.entries["BLOCKS_SWAP"].insert(0, str(blocks_swap))
         except ValueError:
             blocks_swap = config["blocks_swap_max"]
 
@@ -20111,6 +22027,21 @@ class LoRATrainerGUI:
             "SAVE_EVERY_N_EPOCHS": int(self.entries["SAVE_EVERY_N_EPOCHS"].get()),
             "SEED": int(self.entries["SEED"].get()),
             "BLOCKS_SWAP": blocks_swap,
+            # MiniMax-only; the widget exists (hidden) under every family, so read it unconditionally
+            # and let the MiniMax command builder be the one that acts on it.
+            # Stored as the percentage the user typed; the command builder converts it to the
+            # trainer's shift. Keeping the percentage is what makes a saved preset mean the same
+            # thing later, rather than a shift number nobody can interpret.
+            "MINIMAX_LOWNOISE_PCT": str(self.entries["MINIMAX_LOWNOISE_PCT"].get() or "").strip(),
+            "MINIMAX_LOGNORM": bool(self.minimax_lognorm_var.get()),
+            "MINIMAX_BLOCKS": minimax_block_spec(self.entries["MINIMAX_BLOCKS"].get()),
+            "MINIMAX_TRAIN_ADALN": bool(self.entries["MINIMAX_TRAIN_ADALN"].get()),
+            "MINIMAX_DISTILL": bool(self.minimax_distill_var.get()),
+            "MINIMAX_BASE_QUANT": self.entries["MINIMAX_BASE_QUANT"].get(),
+            "MINIMAX_DISTILL_WEIGHT": str(self.entries["MINIMAX_DISTILL_WEIGHT"].get() or "0.8").strip(),
+            "MINIMAX_DISTILL_REFS": str(self.entries["MINIMAX_DISTILL_REFS"].get() or "2").strip(),
+            "MINIMAX_SLOW_BLOCKS": str(self.entries["MINIMAX_SLOW_BLOCKS"].get() or "").strip(),
+            "MINIMAX_SLOW_LR_SCALE": str(self.entries["MINIMAX_SLOW_LR_SCALE"].get() or "1").strip(),
             "DATASET_CONFIG": self._get_path("DATASET_CONFIG"),
             "VAE_MODEL": self._get_path("VAE_MODEL"),
             "CLIP_MODEL": self._get_path("CLIP_MODEL"),
@@ -20288,6 +22219,8 @@ class LoRATrainerGUI:
         """Build the training command based on architecture configuration"""
         if config.get("is_krea2"):
             return self._build_krea2_train_command()
+        if config.get("is_minimax"):
+            return self._build_minimax_train_command()
         arch = self.settings["ARCHITECTURE"]
         # Same reasoning as _venv_python: fall back to whatever is on PATH when the bundled venv
         # is not a sibling of the repo, rather than pointing at a file that is not there.
@@ -20618,6 +22551,9 @@ class LoRATrainerGUI:
         if config.get("is_krea2"):
             return self._build_krea2_cache_command("krea2_cache_latents.py",
                                                    "--vae", self._krea2_pref("krea2_vae"))
+        if config.get("is_minimax"):
+            return self._build_krea2_cache_command("minimax_cache_latents.py",
+                                                   "--vae", self._krea2_pref("minimax_vae"))
         arch = self.settings["ARCHITECTURE"]
         python_path = self._venv_python()
         cache_script_path = self._resolve_script(config, "cache_latents_script")
@@ -20644,6 +22580,16 @@ class LoRATrainerGUI:
         if config.get("is_krea2"):
             return self._build_krea2_cache_command("krea2_cache_text.py",
                                                    "--text_encoder", self._krea2_pref("krea2_text_encoder"))
+        if config.get("is_minimax"):
+            cmd = self._build_krea2_cache_command("minimax_cache_text.py",
+                                                  "--text_encoder", self._krea2_pref("minimax_text_encoder"))
+            # Reference distillation: the TEACHER's conditioning has to be built HERE, because
+            # it needs the 15.7 GB vision-capable encoder and that can never be resident beside
+            # the DiT at training time. Each image is paired with N others from this same
+            # dataset — no picker, and no image is ever its own reference.
+            if self.settings.get("MINIMAX_DISTILL"):
+                cmd += ["--reference_count", str(self.settings.get("MINIMAX_DISTILL_REFS", "2"))]
+            return cmd
         arch = self.settings["ARCHITECTURE"]
         python_path = self._venv_python()
         cache_script_path = self._resolve_script(config, "cache_text_script")
@@ -20709,6 +22655,19 @@ class LoRATrainerGUI:
     def _krea2_script(self, name: str) -> str:
         return os.path.join(FIZGIG_DIR, "src", "fizgig", "scripts", name)
 
+    def _minimax_reference_canvas(self):
+        """The generation size the reference is scaled against — the square at Target Megapixels.
+
+        The trainer sizes the reference against the largest training bucket; matching that here
+        keeps the cached teacher conditioning and the training-time reference latent describing
+        the same picture."""
+        try:
+            mp = float(str(self.dataset_megapixels_var.get()).strip())
+        except (TypeError, ValueError, AttributeError):
+            mp = 0.5
+        side = int(round((mp * 1_000_000) ** 0.5 / 32) * 32) or 512
+        return side, side
+
     def _build_krea2_cache_command(self, script_name: str, model_flag: str, model_path: str):
         """Krea 2 caching: a plain venv-python call to krea2_cache_latents.py / krea2_cache_text.py."""
         return [
@@ -20718,7 +22677,7 @@ class LoRATrainerGUI:
             model_flag, model_path,
         ]
 
-    def _write_krea2_sample_prompts(self):
+    def _write_krea2_sample_prompts(self, filename="krea2_prompts.txt"):
         """Write the Samples-tab prompts as clean lines (one prompt per line) for krea2_train.
 
         Klein's prompt file carries inline flags (`--w`/`--h`/`--s`/...); krea2_train takes
@@ -20736,7 +22695,7 @@ class LoRATrainerGUI:
                 lines.append(ln)
         if not lines:
             return None
-        path = os.path.join(samples_dir, "krea2_prompts.txt")
+        path = os.path.join(samples_dir, filename)
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
         return path
@@ -21026,6 +22985,176 @@ class LoRATrainerGUI:
                     cmd += ["--sample_ref_image", ref_img]
         return cmd
 
+    def _build_minimax_train_command(self):
+        """Build the native MiniMax H3 training command — barebones image-only LoRA over an
+        NF4-quantized frozen base. No samples, no block swap, no context LoRA, no LoKR, no
+        per-image loss watch: just the core knobs (rank/alpha/lr/epochs/save/seed/optimizer) plus
+        adaptive LR and output metadata. Model paths come from Preferences (minimax_*)."""
+        cmd = [
+            self._venv_python(),
+            self._krea2_script("minimax_train.py"),
+            # Distillation trains against ref2va — the teacher only exists on that model.
+            "--dit", (self._krea2_pref("minimax_ref_dit")
+                      if (self.settings.get("MINIMAX_DISTILL")
+                          and self._krea2_pref("minimax_ref_dit"))
+                      else self._krea2_pref("minimax_dit")),
+            "--dataset_config", self.settings["DATASET_CONFIG"],
+            "--output_dir", self.settings["LORA_OUTPUT_DIR"],
+            "--output_name", self.settings["LORA_NAME"],
+            "--network_dim", str(self.settings["NETWORK_DIM"]),
+            "--network_alpha", str(self.settings["NETWORK_ALPHA"]),
+            "--learning_rate", str(self.settings["LEARNING_RATE"]),
+            "--max_train_epochs", str(self.settings["MAX_TRAIN_EPOCHS"]),
+            "--save_every_n_epochs", str(self.settings["SAVE_EVERY_N_EPOCHS"]),
+            "--seed", str(self.settings["SEED"]),
+        ]
+        # Blocks Swap: "Auto (detect from GPU)" resolves in the TRAINER (it reads real free VRAM
+        # at run time — correct for queued runs too); an explicit number passes through.
+        _bs = str(self.settings.get("BLOCKS_SWAP", "auto") or "auto").strip()
+        cmd += ["--blocks_to_swap", "auto" if _bs.lower().startswith("auto") else _bs]
+        # Base Precision. Always sent, including "auto", so the launched command records which
+        # base a run used rather than leaving it implicit — these get A/B'd against each other.
+        cmd += ["--base_quant", minimax_base_quant(self.settings.get("MINIMAX_BASE_QUANT"))]
+        # Gradient Checkpointing. The flag used to not be sent at all here, so the checkbox was
+        # decorative on this family. Ticked (the default) means AUTO — the planner decides from
+        # free VRAM, exactly like Blocks Swap and Base Precision, and in practice that is "on"
+        # for anything short of a 36 GB+ card. Unticked is the explicit override that forces it
+        # off. Deliberately no "force ON": it only differs from auto where there is memory to
+        # spare, and there it just costs ~0.1 s/step for nothing.
+        cmd += ["--gradient_checkpointing",
+                "auto" if self.settings.get("GRADIENT_CHECKPOINTING", True) else "off"]
+        # Detail Focus -> --shift. Sent ALWAYS, including the reference 12, so the launched
+        # command (and the console line recording it) states which density a run used instead of
+        # leaving it implicit — these are meant to be A/B'd against each other, often queued
+        # back to back, and "which one was this?" has to be answerable from the record alone.
+        # The trainer stamps the same thing into the LoRA as ss_timestep_density.
+        # Low-noise share -> shift. Always sent, including the default, so the launched command
+        # records which density ran instead of leaving it implicit.
+        if self.settings.get("MINIMAX_LOGNORM"):
+            _shift = minimax_lownoise_to_lognorm_shift(self.settings.get("MINIMAX_LOWNOISE_PCT"))
+            if _shift is not None:
+                cmd += ["--shift", f"lognorm:{_shift:g}"]
+        else:
+            _shift = minimax_lownoise_to_shift(self.settings.get("MINIMAX_LOWNOISE_PCT"))
+            if _shift is not None:
+                cmd += ["--shift", f"{_shift:g}"]
+        # Blocks to Train — only sent when it's a real range; "all" is the trainer's own default,
+        # and not sending it keeps the flag's presence meaning "this run was a block experiment".
+        _blocks = minimax_block_spec(self.settings.get("MINIMAX_BLOCKS", "all"))
+        if _blocks.lower() != "all":
+            cmd += ["--train_blocks", _blocks]
+        # Reference distillation. Both flags travel together; the trainer also needs --vae to
+        # encode the reference, which the sample block may already have added.
+        if self.settings.get("MINIMAX_DISTILL"):
+            cmd += ["--distill",
+                    "--distill_weight", str(self.settings.get("MINIMAX_DISTILL_WEIGHT", "0.8"))]
+        # AdaLN is ON by default (the reference behaviour), so only the opt-out is ever sent.
+        if not self.settings.get("MINIMAX_TRAIN_ADALN", True):
+            cmd.append("--no_train_adaln")
+        # Depth-split LR: both halves must be present and the multiplier must actually do
+        # something, or the flag pair is noise on the command line.
+        _slow = str(self.settings.get("MINIMAX_SLOW_BLOCKS", "") or "").strip()
+        try:
+            _slow_x = float(self.settings.get("MINIMAX_SLOW_LR_SCALE", 1) or 1)
+        except ValueError:
+            _slow_x = 1.0
+        if _slow and abs(_slow_x - 1.0) > 1e-9:
+            cmd += ["--slow_blocks", _slow, "--slow_block_lr_scale", str(_slow_x)]
+        # LoKR (Kronecker) — dim/alpha still ride along above but the trainer ignores them;
+        # the factor is the dial. Same flags as the Krea 2 builder.
+        if str(self.settings.get("NETWORK_TYPE", "")).startswith("LoKR"):
+            cmd += ["--network_type", "lokr",
+                    "--lokr_factor", str(self.settings.get("LOKR_FACTOR", 8))]
+        # In-training previews. Prompts come from the Samples tab (same widgets every family
+        # uses); the trainer pre-encodes them with the 32B TE before the DiT loads.
+        if self.sample_enabled_var.get():
+            # plain one-prompt-per-line file (same writer Krea 2 uses; own filename so a
+            # MiniMax output dir doesn't sprout a "krea2_" artefact)
+            prompt_file = self._write_krea2_sample_prompts("minimax_prompts.txt")
+            _every = self.sample_every_n_epochs_var.get().strip()
+            _every_n = int(_every) if _every.isdigit() else 0
+            _at_first = bool(getattr(self, "sample_at_first_var", None)
+                             and self.sample_at_first_var.get())
+            # H3 previews are per-EPOCH only; a steps-only config would otherwise silently
+            # produce nothing (same constraint, and same warning, as Krea 2).
+            _steps_only = self.sample_every_n_steps_var.get().strip()
+            if _every_n <= 0 and _steps_only.isdigit() and int(_steps_only) > 0:
+                self.update_console("[samples] MiniMax H3 previews are per-epoch — 'Every N Steps' "
+                                    "has no effect. Set 'Every N Epochs' to enable previews.\n")
+            _te = self._krea2_pref("minimax_text_encoder")
+            if prompt_file and (_every_n > 0 or _at_first) and _te:
+                try:
+                    _seed = str(int(self.sample_seed_var.get().strip()))
+                except (ValueError, AttributeError):
+                    _seed = str(self.settings.get("SAMPLE_SEED", 42))
+                cmd += [
+                    "--sample_prompts", prompt_file,
+                    "--sample_every_n_epochs", str(_every_n),
+                    "--sample_width", (self.sample_width_var.get().strip() or "512"),
+                    "--sample_height", (self.sample_height_var.get().strip() or "512"),
+                    "--sample_seed", _seed,
+                    "--text_encoder", _te,
+                    "--vae", self._krea2_pref("minimax_vae"),
+                ]
+                _st = self.sample_steps_var.get().strip()
+                if _st.isdigit() and int(_st) > 0:
+                    cmd += ["--sample_steps", _st]
+                try:
+                    _cfg = float(self.sample_cfg_scale_var.get().strip())
+                except (ValueError, AttributeError):
+                    _cfg = 1.0
+                if abs(_cfg - 1.0) > 1e-9:
+                    cmd += ["--sample_cfg_scale", str(_cfg)]
+                    _neg = (self.sample_negative_var.get().strip()
+                            if getattr(self, "sample_negative_var", None) else "")
+                    if _neg:
+                        cmd += ["--sample_negative", _neg]
+                if _at_first:
+                    cmd.append("--sample_at_first")
+            elif prompt_file and (_every_n > 0 or _at_first) and not _te:
+                self.update_console("[samples] previews need the Qwen3-VL-32B text encoder path "
+                                    "— set it in Preferences. Training continues without them.\n")
+        # Resumable state saving + resume — identical flag names across all three families.
+        cmd += self._state_flags()
+        resume_path = (self.settings.get("RESUME_TRAINING") or "").strip()
+        if resume_path:
+            cmd += ["--resume", resume_path]
+        # Adaptive LR — bi-directional plateau tracker (model-agnostic). Min/Max combo values can
+        # carry a trailing note (e.g. "2e-4 - rank 4/8 only"); take the leading token.
+        if self.settings.get("ADAPTIVE_LR"):
+            min_lr = str(self.settings.get("ADAPTIVE_LR_MIN", "1e-5")).split(" ")[0]
+            max_lr = str(self.settings.get("ADAPTIVE_LR_MAX", "4e-4")).split(" ")[0]
+            cmd += ["--adaptive_lr", "--adaptive_lr_min", min_lr, "--adaptive_lr_max", max_lr]
+        # Grad clipping + optimizer (Optimizer section). 1.0 is the trainer default — send only
+        # when the user changed it, keeping the launched command a faithful record otherwise.
+        _mgn = str(self.settings.get("MAX_GRAD_NORM", "") or "").strip()
+        if _mgn:
+            try:
+                if abs(float(_mgn) - 1.0) > 1e-9:
+                    cmd += ["--max_grad_norm", str(float(_mgn))]
+            except ValueError:
+                pass
+        _opt = str(self.settings.get("OPTIMIZER_TYPE", "") or "").strip()
+        if _opt:
+            cmd += ["--optimizer_type", _opt]
+        _opt_args = str(self.settings.get("OPTIMIZER_ARGS", "") or "").strip()
+        if _opt_args:
+            cmd += ["--optimizer_args", _opt_args]
+        # Output metadata (Other Options → Metadata) — recorded in the saved LoRA.
+        for _mkey, _mflag in (("METADATA_TITLE", "--metadata_title"),
+                              ("METADATA_AUTHOR", "--metadata_author"),
+                              ("METADATA_DESCRIPTION", "--metadata_description"),
+                              ("METADATA_LICENSE", "--metadata_license"),
+                              ("METADATA_TAGS", "--metadata_tags")):
+            _mval = str(self.settings.get(_mkey, "") or "").strip()
+            if _mval:
+                cmd += [_mflag, _mval]
+        _mtrig = self.settings.get("METADATA_TRIGGER_PHRASE", "").strip() or \
+            (self.caption_trigger_var.get().strip() if hasattr(self, "caption_trigger_var") else "")
+        if _mtrig and _mtrig.lower() != "trigger_word":
+            cmd += ["--metadata_trigger_phrase", _mtrig]
+        return cmd
+
     # === Pause / Resume support ===
 
     def _pause_flag_path(self) -> str:
@@ -21042,6 +23171,21 @@ class LoRATrainerGUI:
         """Show/hide Pause and Resume buttons based on self.training_state."""
         if not hasattr(self, "training_state"):
             self.training_state = "idle"
+        # While a run is active the Start button queues instead of starting — say so on
+        # the button itself rather than surprising the user with a popup.
+        try:
+            self._start_training_btn.config(
+                text="Queue Train" if self.training_state in ("running", "pausing")
+                else "Start Training")
+        except Exception:
+            pass
+        # Every state transition passes through here, so it's the one hook that keeps an
+        # OPEN queue window truthful (finish, advance, failure-hold, pause) — the render
+        # no-ops when the window isn't up.
+        try:
+            self._render_queue_window()
+        except Exception:
+            pass
         # Pause: visible while running (Krea 2 now saves full state at the epoch boundary, so
         # graceful Pause/Resume works the same as Klein).
         if self.training_state == "running":
@@ -21230,8 +23374,37 @@ class LoRATrainerGUI:
         # Only a run that finished on its own. Pause exits 0 too (state "pausing"); Stop and
         # crashes arrive non-zero. Each of the three conditions excludes a real case, and getting
         # it wrong shuts the machine down under someone who is still using it.
+        # Every run exit invalidates whatever advance/retry timers were armed before it —
+        # a stale tick must never fire into the state this exit is about to establish.
+        self._cancel_pending_queue_advance()
+        _queue_advancing = False
         if return_code == 0 and was_state == "running":
-            self._maybe_stop_pod_after_training()
+            if getattr(self, "training_queue", None):
+                # Queue takes precedence over pod auto-stop: the pod must stay up until the
+                # LAST queued run finishes — that final run's clean exit lands here with an
+                # empty queue and fires the auto-stop as usual.
+                _queue_advancing = True
+                self._queue_busy_retries = 0
+                self.update_console(f"\n[queue] run finished — next of "
+                                    f"{len(self.training_queue)} queued run(s) starts in 5 s.\n")
+                self._schedule_queue_advance(5000)
+            else:
+                self._maybe_stop_pod_after_training()
+        elif getattr(self, "training_queue", None):
+            # Failure, Stop, or Pause with runs still waiting: never cascade into the queue —
+            # a crash loop through N queued runs would burn hours producing nothing. The queue
+            # holds; the user restarts it from the queue window.
+            if was_state == "pausing" and return_code == 0:
+                self.update_console(f"[queue] run paused — {len(self.training_queue)} queued "
+                                    f"run(s) are HELD. Resume the paused run from the Training "
+                                    f"tab first; the queue continues after it finishes.\n")
+            else:
+                self.update_console(
+                    f"[queue] run did not finish cleanly (exit {return_code}) — "
+                    f"{len(self.training_queue)} queued run(s) are HELD. The FAILED run is not "
+                    f"in the queue: its settings are still loaded in the Training tab (fix and "
+                    f"Start Training to retry it), or open the queue (📋, bottom right) and "
+                    f"'Start next now' to skip to the next job.\n")
         if getattr(self, "training_state", "idle") == "pausing" and return_code == 0:
             # Successful graceful exit — record paused state
             state_dir = self._detect_latest_state_dir()
@@ -21293,17 +23466,24 @@ class LoRATrainerGUI:
                 entry.insert(0, state_path)
         except Exception:
             pass
-        # Clean up paused sidecar — we're consuming it
-        try:
-            sidecar = self._paused_sidecar_path()
-            if os.path.exists(sidecar):
-                os.remove(sidecar)
-        except Exception:
-            pass
         self.update_console(f"\n=== RESUMING from {state_path} ===\n\n")
-        self.training_state = "running"
-        self._refresh_training_buttons()
         self.start_training()
+        # Only a start that actually LAUNCHED consumes the pause. start_training can decline
+        # (validation, disk headroom, epochs-left) — destroying the sidecar and flipping the
+        # state beforehand stranded a declinable resume with no way back to the paused run.
+        _proc = getattr(self, "current_process", None)
+        if getattr(self, "training_state", "idle") == "running" and _proc is not None and _proc.poll() is None:
+            try:
+                sidecar = self._paused_sidecar_path()
+                if os.path.exists(sidecar):
+                    os.remove(sidecar)
+            except Exception:
+                pass
+        else:
+            self.training_state = "paused"
+            self._refresh_training_buttons()
+            self.update_console("[resume] start declined — the run is still PAUSED and can be "
+                                "resumed once the issue above is fixed.\n")
 
     def _check_for_paused_state_on_startup(self):
         """On GUI launch, detect a leftover paused state and restore the Resume button."""
@@ -21361,26 +23541,34 @@ class LoRATrainerGUI:
         """Stop the current running process"""
         # Stop samples watcher
         self.stop_samples_watcher()
-
-        if self.current_process and self.current_process.poll() is None:
+        # A user Stop invalidates any armed queue-advance/retry timer immediately — the
+        # exit handler bumps too, but for non-pipeline kills this is the only bump.
+        try:
+            self._cancel_pending_queue_advance()
+        except Exception:
+            pass
+        # Snapshot: check_process's worker nulls self.current_process the instant the kill
+        # lands, racing the .wait(timeout=5) below into an AttributeError on None.
+        _proc = self.current_process
+        if _proc and _proc.poll() is None:
             try:
                 if os.name == 'nt':
                     # CREATE_NO_WINDOW prevents CTRL_BREAK_EVENT from working,
                     # so terminate the process tree via taskkill instead.
                     subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", str(self.current_process.pid)],
+                        ["taskkill", "/F", "/T", "/PID", str(_proc.pid)],
                         capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
                     )
                 else:
-                    os.killpg(os.getpgid(self.current_process.pid), signal.SIGTERM)
+                    os.killpg(os.getpgid(_proc.pid), signal.SIGTERM)
             except Exception as e:
                 self.update_console("Error stopping process: " + str(e) + "\n")
             try:
-                self.current_process.wait(timeout=5)
+                _proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 try:
-                    self.current_process.kill()
-                    self.current_process.wait()
+                    _proc.kill()
+                    _proc.wait()
                 except Exception as e:
                     self.update_console("Error killing process: " + str(e) + "\n")
             self.current_process = None
@@ -21406,6 +23594,12 @@ if __name__ == "__main__":
     # Detect leftover paused training state from a prior session
     try:
         gui._check_for_paused_state_on_startup()
+    except Exception:
+        pass
+    # Quiet update check a couple of seconds in — off the critical launch path, and it only
+    # ever surfaces as the About-button label flipping to "Update Available".
+    try:
+        root.after(2500, gui._start_update_check)
     except Exception:
         pass
     root.mainloop()
