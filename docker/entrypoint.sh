@@ -88,8 +88,27 @@ if [ -d "$APP_DIR/.git" ]; then
   # line (no [fizgig] prefix, nothing that reads as an error) to show for it.
   if ! git -C "$APP_DIR" fetch --depth 1 origin "$REPO_REF" \
       || ! git -C "$APP_DIR" reset --hard FETCH_HEAD; then
-    log "ERROR: could not update to '$REPO_REF' from $REPO_URL — check FIZGIG_REPO/FIZGIG_REF for a typo."
-    log "       Continuing on whatever was already checked out ($(git -C "$APP_DIR" rev-parse --short HEAD 2>/dev/null))."
+    # A checkout on a persistent volume can wedge permanently — a hard pod stop corrupts
+    # git's object store, and from then on EVERY pod that mounts this volume fails this
+    # update and silently runs old code, whatever image it booted from (observed in the
+    # field: three different images, one stale volume). Limping on was the wrong policy:
+    # quarantine the broken clone (rescuing a models dir if one ever landed inside) and
+    # re-clone fresh. One slow boot instead of weeks of mystery-old pods.
+    log "ERROR: could not update to '$REPO_REF' from $REPO_URL."
+    if git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$APP_DIR.fresh"; then
+      log "Re-cloning: the old checkout is quarantined at $APP_DIR.broken (delete it when convenient)."
+      if [ -d "$APP_DIR/models" ]; then
+        log "Rescuing $APP_DIR/models into the fresh checkout."
+        mv "$APP_DIR/models" "$APP_DIR.fresh/models"
+      fi
+      rm -rf "$APP_DIR.broken" 2>/dev/null || true
+      mv "$APP_DIR" "$APP_DIR.broken"
+      mv "$APP_DIR.fresh" "$APP_DIR"
+    else
+      log "ERROR: re-clone failed too — check FIZGIG_REPO/FIZGIG_REF for a typo, or network access."
+      log "       Continuing on whatever was already checked out ($(git -C "$APP_DIR" rev-parse --short HEAD 2>/dev/null))."
+      rm -rf "$APP_DIR.fresh" 2>/dev/null || true
+    fi
   fi
 else
   log "Cloning Fizgig ($REPO_REF)"
@@ -98,9 +117,11 @@ fi
 
 # Top up dependencies in case the checkout is newer than the image. Almost always a no-op, and
 # a few seconds when it isn't — far cheaper than making users re-pull 10 GB for a new pin.
+# uv_install_deps.py comes from the fresh checkout above, not the image, so a pin/index-strategy
+# fix to it reaches running pods on their next restart same as any other source change.
 log "Checking dependencies"
-uv pip install --link-mode=copy --index-strategy unsafe-best-match \
-   -r "$APP_DIR/requirements.txt" 2>&1 | tail -2 || log "dependency top-up skipped"
+python3 "$APP_DIR/uv_install_deps.py" "$APP_DIR/requirements.txt" "$VIRTUAL_ENV" \
+   2>&1 | tail -5 || log "dependency top-up skipped"
 
 # ---------------------------------------------------------------- persistent paths
 # Point the portable output dirs at the volume. Model paths are left alone: fetch_models writes

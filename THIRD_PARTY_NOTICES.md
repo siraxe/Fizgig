@@ -2,10 +2,12 @@
 
 Fizgig is licensed under the Apache License, Version 2.0 (see `LICENSE`).
 
-It includes code derived from the third-party projects listed below. Each is
-adapted under its own license; all are permissive and compatible with
-Apache-2.0. Where a file was modified, that is noted — Fizgig's changes are
-themselves released under Apache-2.0.
+It includes code derived from the third-party projects listed below. Each
+component remains under its upstream license. Permissive components (Apache-2.0,
+MIT) are compatible with Fizgig's Apache-2.0 license; where those files were
+modified, Fizgig's changes are released under Apache-2.0. Copyleft components
+(GPL-3.0) are marked separately and stay under GPL-3.0 — see the comfyui-rocm
+section below.
 
 ---
 
@@ -39,6 +41,11 @@ The Krea 2 single-stream MMDiT backbone (`src/fizgig/krea2/model.py`) and the
 functional flow-matching sampler (`src/fizgig/krea2/sampling.py`) are ported
 from ai-toolkit's `extensions_built_in/diffusion_models/{krea2,flux2}/src`,
 then adapted for Fizgig.
+
+The Automagic v3 optimizer (`src/fizgig/training/automagic3.py`) is kept
+byte-for-byte as upstream's `toolkit/optimizers/automagic3.py`, under a Fizgig
+header describing how it is constructed. Offered as an optimizer choice on the
+MiniMax H3 and Krea 2 LoRA paths.
 
 ```
 MIT License
@@ -88,10 +95,57 @@ All rights reserved. Licensed under the Apache License, Version 2.0.
 
 ---
 
+## comfyui-rocm — GNU General Public License v3.0
+
+Upstream: https://github.com/patientx/comfyui-rocm
+Copyright the comfyui-rocm authors (patientx and contributors).
+
+comfyui-rocm is a Windows ROCm build of ComfyUI. Fizgig's AMD ROCm Windows
+installer uses code from that project as follows:
+
+- `detect_gpu.py` — copied verbatim from comfyui-rocm's `detect_gpu.py`
+  (AMD GPU → gfx architecture detection on Windows). **Unmodified.** This file
+  is **GPL-3.0 only**; it is not relicensed under Apache-2.0.
+- `install_fizgig_rocm.bat` — Fizgig-authored installer that **calls**
+  `detect_gpu.py` and follows the same ROCm-wheel install patterns as
+  comfyui-rocm's `install.bat` (adapted for Fizgig's venv and
+  requirements). The batch file itself is Apache-2.0; the bundled
+  `detect_gpu.py` remains GPL-3.0.
+- `run_fizgig_rocm.bat` / `run_fizgig_rocm.sh` — Fizgig-authored launchers.
+  Legacy RDNA1/2 SDP overrides, aotriton gating, and MIOpen/rocBLAS tensile
+  DB path setup are adapted from comfyui-rocm's `comfyui-rocm.bat`. The
+  launchers themselves are Apache-2.0; Windows detection still goes through
+  the GPL-3.0 `detect_gpu.py` above.
+
+`detect_gpu.py` is free software: you may redistribute and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. A copy of the GPL-3.0 text is available at
+https://www.gnu.org/licenses/gpl-3.0.html and in comfyui-rocm's `LICENSE` file.
+
+To receive source for `detect_gpu.py`, use this repository or the upstream
+comfyui-rocm repository linked above.
+
+---
+
+## bitsandbytes Windows ROCm wheel (0xDELUXA) — downloaded at install time
+
+The Windows AMD installer (`install_fizgig_rocm.bat`) downloads a **pinned**
+community bitsandbytes wheel from:
+
+https://github.com/0xDELUXA/bitsandbytes_win_rocm
+
+That wheel is **not** built by AMD or Fizgig; it is only fetched on the AMD
+install path. Official ROCm PyTorch wheels similarly come from AMD's nightly
+index (`https://rocm.nightlies.amd.com/whl-multi-arch/`), also disclosed by the
+installer before download.
+
+---
+
 ## Note on model weights
 
 The third-party notices above cover **source code** only. Krea 2 / FLUX.2 model
-weights, the Qwen-Image VAE weights, and the Qwen3-VL text-encoder weights are
-distributed by their respective publishers under their own model licenses, which
+weights, the Qwen-Image VAE weights, the Qwen3-VL text-encoder weights, and the
+MiniMax H3 training adapters (circlestone-labs and Ostris) are distributed by their respective publishers under their own model licenses, which
 the user accepts when downloading them. Fizgig does not redistribute any model
 weights.

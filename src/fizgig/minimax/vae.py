@@ -1,13 +1,14 @@
-"""MiniMax H3 video VAE — ENCODE PATH ONLY (image -> 24-channel latent).
+"""MiniMax H3 video VAE — ENCODE PATH ONLY (image or clip -> 24-channel latent).
 
 Pure-PyTorch port of the encoder half of ComfyUI's comfy/ldm/minimax/vae.py. Image-only
 training needs to turn a still image into the DiT's 24-channel latent exactly once (caching),
 so only the 3D-causal-CNN encoder + quant_conv + latent normalization are ported. The ViT3D
-decoder, spatial tiling and temporal chunking are omitted — no sampling/decode in scope.
+decoder and spatial/temporal tiling are omitted — no sampling/decode in scope.
 
 Weight names match the checkpoint's `encoder.*` / `quant_conv.*` / `latents_mean/std`, so the
 official minimax_h3_video_vae_fp16.safetensors loads with strict=False (decoder/post_quant keys
-ignored). A single image is one video frame (T=1): 16x spatial downscale, T stays 1.
+ignored). 16x spatial downscale; 4x causal temporal downscale, so a still (T=1) stays T=1 and a
+clip of T frames yields ceil(T/4) latent frames.
 """
 
 import math
@@ -163,16 +164,81 @@ class MiniMaxH3VideoVAEEncoder(nn.Module):
         self.register_buffer("pixel_std", torch.tensor(IMAGENET_STD).view(1, 3, 1, 1, 1), persistent=False)
 
     @torch.no_grad()
+    @staticmethod
+    def plan_clip_bucket(free_gb, width, height, reserve_gb=1.5):
+        """Largest /32 bucket of this shape whose clip encode fits in `free_gb`.
+
+        Encoding a clip is far more expensive than encoding a still of the same size — the whole
+        17-frame group is live at once — and a mixed dataset lets someone pick 1 MP for their
+        photographs without knowing that no consumer card can cache a clip at it. Refusing the
+        run would be the wrong answer: the stills are fine, and the clips are still worth having
+        at a size that fits.
+
+        MEASURED on a 5090, fp32, encoding in 17-frame groups:
+
+            0.09 MP  5.6 GiB     0.26 MP  14.2 GiB     0.52 MP  28.0 GiB     0.66 MP  OOM
+
+        which is 0.9 + 52 x megapixels, within 0.3 GiB across that range, and flat in clip length
+        (124 frames costs 0.3 GiB more than 22). So the cap is a straight solve, with the same
+        1.5 GiB left for the allocator and the display that the training planner reserves.
+        """
+        budget = max(0.0, float(free_gb) - float(reserve_gb) - 0.9)
+        max_pixels = budget / 52.0 * 1e6
+        if width * height <= max_pixels or max_pixels < 32 * 32:
+            return int(width), int(height)
+        scale = (max_pixels / (width * height)) ** 0.5
+        w = max(32, int(width * scale) // 32 * 32)
+        h = max(32, int(height * scale) // 32 * 32)
+        return w, h
+
+    def encode_clip(self, x):
+        """A whole clip -> [B,24,T',H/16,W/16], encoded in the groups the model expects.
+
+        Encoding a clip in ONE call is wrong twice over, and the first way is silent.
+
+        H3's latent clock is (1,4,4,4,4) repeating — five latent frames covering seventeen pixel
+        frames, restarting with a keyframe. Feeding all 22 frames of a clip to `encode` gives six
+        latent frames; feeding 17 then 5 gives 5+2 = 7, which is what the DiT's position ids and
+        audio clock are built for. Both numbers are plausible tensor shapes, so the wrong one does
+        not raise — it just trains against a misaligned target. (Measured on the real weights.)
+
+        The second way is loud: `encode` has no temporal chunking, so peak activation follows the
+        whole clip at once. A 39-frame clip peaks at 30 GiB and a 56-frame one will not fit on a
+        32 GB card at all. In 17-frame groups the peak is fixed by the group, so length costs
+        nothing extra here and the ceiling moves to the training step where it belongs.
+        """
+        t = x.shape[2] if x.ndim == 5 else 1
+        if t <= 1:
+            return self.encode(x)
+        if t < 5 or (t - 5) % 17:
+            raise ValueError(f"{t} frames is not on H3's 17n+5 grid — the VAE could not have "
+                             f"produced a latent for it")
+        # n groups of 17, then the 5 that every grid length ends on: 22 = 17+5, 39 = 17+17+5.
+        sizes = [17] * ((t - 5) // 17) + [5]
+        out, i = [], 0
+        for size in sizes:
+            out.append(self.encode(x[:, :, i:i + size]))
+            i += size
+        return torch.cat(out, dim=2)
+
     def encode(self, x):
-        """x: [B,3,H,W] or [B,3,T,H,W] in [-1,1] -> normalized latent [B,24,1,H/16,W/16] (image: T=1)."""
+        """x: [B,3,H,W] or [B,3,T,H,W] in [-1,1] -> normalized latent [B,24,ceil(T/4),H/16,W/16].
+
+        A CLIP should go through `encode_clip` instead — see there for why calling this with all
+        of a clip's frames gives the wrong number of latent frames without raising.
+
+        The stack is temporally causal with a 4x stride, so latent frame k depends only on pixel
+        frames up to 4k (verified by perturbation) and a still gives T'=1 — the image path is
+        unchanged. Feed 1+4k frames for a clean 1+k latent frames.
+
+        No temporal chunking: peak activation is dominated by the first level at full T x H x W,
+        so long clips want tiling that this port does not implement. Encode in clips.
+        """
         if x.ndim == 4:
             x = x.unsqueeze(2)
         x = (x + 1.0) * 0.5
         x = (x - self.pixel_mean.to(x)) / self.pixel_std.to(x)
-        if x.shape[2] != 1:
-            raise NotImplementedError("MiniMax H3 image training encodes a single frame (T=1)")
         moments = self.quant_conv(self.encoder(x))
-        moments = moments[:, :, -1:, :, :]
         mean = torch.chunk(moments.float(), 2, dim=1)[0]
         lm = self.latents_mean.view(1, -1, 1, 1, 1).to(mean)
         ls = self.latents_std.view(1, -1, 1, 1, 1).to(mean)
@@ -403,26 +469,168 @@ class MiniMaxH3VideoVAEDecoder(nn.Module):
         decoder ever saw (measured: 16 dB and visibly dark). See `single_frame_mode` above for
         which replication scheme runs."""
         if z.shape[2] != 1:
-            raise NotImplementedError(
-                "MiniMax H3 decode here is single-frame (latent_t == 1); multi-frame needs the "
-                "reference's temporal chunking, which is not ported.")
-        n_rep, _ = self._pad_and_index()
+            return self.decode_clip(z)
+        n_rep, keep = self._pad_and_index()
         lm = self.latents_mean.view(1, -1, 1, 1, 1).to(z)
         ls = self.latents_std.view(1, -1, 1, 1, 1).to(z)
         # Follow the module's own dtype rather than forcing fp32: this decoder is 2.4 B params,
-        # so fp32 residency is 9.7 GB against bf16's 4.8 GB — a difference that matters when it
-        # is loaded on top of the resident base for a preview.
+        # so fp32 residency is 9.7 GB against 4.8 GB for a 16-bit dtype — a difference that
+        # matters when it is loaded on top of the resident base for a preview. Callers should
+        # load it FP16 (the weights' native format, and the only 16-bit dtype ComfyUI permits
+        # for this VAE), not bf16.
         w_dtype = self.post_quant_conv.weight.dtype
         # post_quant_conv is a real learned 1x1x1 channel mix, NOT an identity — skipping it
         # leaves the image structurally recognisable but badly wrong (measured: 7 dB PSNR).
         zz = self.post_quant_conv((z * ls + lm).to(w_dtype)).repeat(1, 1, n_rep, 1, 1)
-        dec = self._tiled_decode(zz)                    # -> [B, 3, H*16, W*16]
+        dec = self._tiled_decode(zz)[:, :, keep]        # -> [B, 3, H*16, W*16]
         dec = dec.float() * self.pixel_std.to(dec)[:, :, 0] + self.pixel_mean.to(dec)[:, :, 0]
         return dec.clamp_(0.0, 1.0)
 
+    # --- multi-frame decode: the reference's temporal chunking, ported ------------------------
+    # comfy/ldm/minimax/vae.py::decode_temporal with its constants resolved for this VAE:
+    # vae_ratio_t=4, clip_length=17 -> tokens_chunk_size=5, token_overlap=(-3)%5=2,
+    # frame_pre_padding=(-17)%4=3, frame_overlap=max(2*4-3,0)=5. Each chunk decodes 5+2
+    # latent tokens spatially tiled, drops the 3-frame causal lead-in, keeps the first 17
+    # frames, and cross-fades a 5-frame overlap into the next chunk — so 5n+2 latents come
+    # back as exactly 17n+5 pixel frames.
+    _RATIO_T = 4
+    _CHUNK_TOK = 5
+    _TOK_OVERLAP = 2
+    _PRE_PAD = 3
+    _FRAME_OVERLAP = 5
+
+    @torch.no_grad()
+    def decode_clip(self, z):
+        """z: normalized latent [B, 24, T_lat, H, W] (T_lat on the 5n+2 grid) ->
+        pixels [B, 3, 17n+5, H*16, W*16] in [0, 1]."""
+        from fizgig.minimax.model import pixel_frames_for_latent
+        out_frames = pixel_frames_for_latent(int(z.shape[2]))    # validates the grid too
+        lm = self.latents_mean.view(1, -1, 1, 1, 1).to(z)
+        ls = self.latents_std.view(1, -1, 1, 1, 1).to(z)
+        w_dtype = self.post_quant_conv.weight.dtype
+        zz = self.post_quant_conv((z * ls + lm).to(w_dtype))
+
+        # token padding: pseudo length includes the 3 dropped-by-encode tokens
+        pseudo = zz.shape[2] + self._PRE_PAD
+        pad_tokens = (-pseudo) % self._CHUNK_TOK
+        num_chunks = (pseudo + pad_tokens) // self._CHUNK_TOK - 1
+        if num_chunks < 1:
+            pad_tokens += self._CHUNK_TOK
+            num_chunks += 1
+        if pad_tokens:
+            zz = torch.cat([zz, zz[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)], dim=2)
+
+        chunk_dec = self._CHUNK_TOK * self._RATIO_T
+        dec, dec_overlap, write_pos = None, None, 0
+
+        def write_part(part):
+            nonlocal dec, write_pos
+            if part.shape[2] <= 0:
+                return
+            if dec is None:
+                # fp32 from the start: copy_ casts each part exactly as the old final
+                # .float() did, and the scale below runs in place — no second full-clip
+                # copy (316 MB at 768×640×56 — the allocation a 24 GB card ran out on).
+                shape = list(part.shape)
+                shape[2] = out_frames
+                dec = torch.empty(shape, dtype=torch.float32, device=part.device)
+            n = min(part.shape[2], max(0, dec.shape[2] - write_pos))
+            if n > 0:
+                dec[:, :, write_pos:write_pos + n].copy_(part[:, :, :n])
+                write_pos += n
+
+        for i in range(num_chunks):
+            t0 = i * self._CHUNK_TOK
+            clip = zz[:, :, t0:t0 + self._CHUNK_TOK + self._TOK_OVERLAP]
+            clip_dec = self._tiled_decode(clip)                  # [B,3,4*tok,h,w], spatially tiled
+            for j in range(2):                                   # split_count with token_drop > 0
+                f0 = j * chunk_dec
+                f1 = min(f0 + chunk_dec, clip_dec.shape[2])
+                # the reference drops the 3-frame causal lead-in from EVERY split chunk:
+                # j=0 -> frames [3:20] (17 kept), j=1 -> [23:28] (the 5-frame overlap)
+                if j == 0:
+                    part = clip_dec[:, :, self._PRE_PAD:f1]
+                    if dec_overlap is not None:
+                        part = self._blend(dec_overlap, part, self._FRAME_OVERLAP, dim=-3)
+                        dec_overlap = None
+                    write_part(part)
+                else:
+                    dec_overlap = clip_dec[:, :, f0 + self._PRE_PAD:f1].contiguous()
+            if i == num_chunks - 1 and dec_overlap is not None:
+                write_part(dec_overlap)
+                dec_overlap = None
+            del clip_dec, clip
+
+        dec.mul_(self.pixel_std.to(dec)).add_(self.pixel_mean.to(dec))
+        return dec.clamp_(0.0, 1.0)
+
+    @torch.no_grad()
+    def decode_middle_frame(self, z, frame_idx=None):
+        """Decode ONE frame of a clip latent by decoding only the temporal chunk(s) that
+        contribute to it. Returns pixels [B, 3, H*16, W*16] in [0, 1] — numerically identical
+        to `decode_clip(z)[:, :, frame_idx]`, including the cross-fade when the frame sits in
+        a chunk-boundary blend zone (then the previous chunk decodes too).
+
+        At 22 frames the whole clip is one chunk, so this saves nothing; at 56 frames it
+        decodes 1 of 3 chunks, at 124 one of 7. `frame_idx=None` means the middle frame."""
+        from fizgig.minimax.model import pixel_frames_for_latent
+        out_frames = pixel_frames_for_latent(int(z.shape[2]))
+        if z.shape[2] == 1:
+            return self.decode(z)
+        if frame_idx is None:
+            frame_idx = out_frames // 2
+        frame_idx = max(0, min(out_frames - 1, int(frame_idx)))
+
+        lm = self.latents_mean.view(1, -1, 1, 1, 1).to(z)
+        ls = self.latents_std.view(1, -1, 1, 1, 1).to(z)
+        w_dtype = self.post_quant_conv.weight.dtype
+        zz = self.post_quant_conv((z * ls + lm).to(w_dtype))
+
+        # Same chunk bookkeeping as decode_clip.
+        pseudo = zz.shape[2] + self._PRE_PAD
+        pad_tokens = (-pseudo) % self._CHUNK_TOK
+        num_chunks = (pseudo + pad_tokens) // self._CHUNK_TOK - 1
+        if num_chunks < 1:
+            pad_tokens += self._CHUNK_TOK
+            num_chunks += 1
+        if pad_tokens:
+            zz = torch.cat([zz, zz[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)], dim=2)
+
+        chunk_dec = self._CHUNK_TOK * self._RATIO_T
+        chunk_len = chunk_dec - self._PRE_PAD              # 17 kept pixel frames per chunk
+
+        def _chunk_parts(i):
+            t0 = i * self._CHUNK_TOK
+            cd = self._tiled_decode(zz[:, :, t0:t0 + self._CHUNK_TOK + self._TOK_OVERLAP])
+            main = cd[:, :, self._PRE_PAD:chunk_dec]       # the 17 frames this chunk owns
+            overlap = cd[:, :, chunk_dec + self._PRE_PAD:]  # up to 5 frames fed forward
+            return main, overlap
+
+        tail_start = num_chunks * chunk_len
+        if frame_idx >= tail_start:
+            # The final 17n..17n+4 frames are the last chunk's overlap, written raw.
+            _, overlap = _chunk_parts(num_chunks - 1)
+            frame = overlap[:, :, frame_idx - tail_start]
+        else:
+            ci = frame_idx // chunk_len
+            local = frame_idx - ci * chunk_len
+            main, _ = _chunk_parts(ci)
+            frame = main[:, :, local]
+            if ci > 0 and local < self._FRAME_OVERLAP:
+                # Cross-fade zone: blend with the previous chunk's overlap using the same
+                # weights _blend applies at this position (wa = 1 - pos/extent).
+                _, prev_overlap = _chunk_parts(ci - 1)
+                extent = min(prev_overlap.shape[2], chunk_len, self._FRAME_OVERLAP)
+                if local < extent:
+                    wb = torch.tensor(local / extent, dtype=frame.dtype, device=frame.device)
+                    frame = prev_overlap[:, :, local] * (1 - wb) + frame * wb
+        frame = frame.float() * self.pixel_std.to(frame)[:, :, 0] + self.pixel_mean.to(frame)[:, :, 0]
+        return frame.clamp_(0.0, 1.0)
+
     def _decode_tile(self, zz):
-        """One tile: the replicated clip in, the single kept frame out."""
-        return self.decoder(zz)[:, :, self._pad_and_index()[1]]
+        """One spatial tile: the full decoded clip [B, 3, 4*T, h*16, w*16] — temporal selection
+        is the caller's job (single-frame keeps one frame; decode_clip slices per chunk)."""
+        return self.decoder(zz)
 
     def _split_tiles(self, input_len):
         """Tile starts/lengths/overlaps in PIXELS, matching the reference's layout."""

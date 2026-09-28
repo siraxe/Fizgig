@@ -94,6 +94,9 @@ class Krea2RepairEngine:
         # Cooperative cancellation: set to abort an in-flight render so a new edit restarts it
         # immediately instead of queueing behind the full 8-step pass.
         self._cancel_event = threading.Event()
+        # Optional progress hook: called (step_done, total_steps) once per denoising step,
+        # from the render thread. The GUI sets it to drive a determinate progress bar.
+        self.on_step = None
         # Baseline render cache (LoRA at original strengths; slider tweaks don't invalidate it).
         self._baseline_cache_key = None
         self._baseline_cache_image: Optional[Image.Image] = None
@@ -231,16 +234,28 @@ class Krea2RepairEngine:
         """Push the per-block slider config into the live networks (regex-based, no reload)."""
         if self.primary_network is None:
             return
+        # Load strength (16 Sep 2026, as on H3): each slider is relative to it — a block at 1.0
+        # is that block at the load strength. Preview-time only; the bake never applies it.
+        ps = float(getattr(state, "primary_scale", 1.0))
+        ds = float(getattr(state, "donor_scale", 1.0))
+        # A full Krea 2 LoRA has 8 Linears outside the 32-block map (first, last, the t/txt
+        # MLPs, the projectors): no slider reaches them, but the load strength must — or a
+        # LoRA "at 0.5" renders 256 modules at half and those 8 at full (review, 16 Sep).
+        for _net, _scale in ((self.primary_network, ps), (self.donor_network, ds)):
+            if _net is None:
+                continue
+            for _m in getattr(_net, "unet_loras", ()):
+                _m.multiplier = float(_scale)
         for bid, bs in state.blocks.items():
             try:
                 pat = block_regex_krea2(bid)
             except ValueError:
                 continue
             self.primary_network.set_module_enabled_by_pattern(pat, bool(bs.primary_enabled))
-            self.primary_network.set_module_multiplier_by_pattern(pat, float(bs.primary_strength))
+            self.primary_network.set_module_multiplier_by_pattern(pat, float(bs.primary_strength) * ps)
             if self.donor_network is not None:
                 self.donor_network.set_module_enabled_by_pattern(pat, bool(bs.donor_enabled))
-                self.donor_network.set_module_multiplier_by_pattern(pat, float(bs.donor_strength))
+                self.donor_network.set_module_multiplier_by_pattern(pat, float(bs.donor_strength) * ds)
 
     # ----- cancellation ------------------------------------------------------
     def request_cancel(self) -> None:
@@ -330,11 +345,25 @@ class Krea2RepairEngine:
                            self._seed_noise(seed_b, width, height))
 
         from fizgig.krea2 import sampling
+        # should_abort is polled once per step, so counting its calls IS the step counter —
+        # the sampler itself has no progress callback to thread through.
+        _done = [0]
+
+        def _abort_and_count():
+            cb = self.on_step
+            if cb is not None:
+                try:
+                    cb(_done[0], steps)
+                except Exception:
+                    pass
+            _done[0] += 1
+            return self._cancel_event.is_set()
+
         with torch.no_grad():
             imgs = sampling.sample(self.turbo, self.ae, txt, txtmask, untxt=None, untxtmask=None,
                                    device=self.device, dtype=self.dtype, width=width, height=height,
                                    steps=steps, cfg_scale=1.0, mu=1.15, seed=seed,
-                                   should_abort=self._cancel_event.is_set, noise=noise)
+                                   should_abort=_abort_and_count, noise=noise)
         return imgs[0]
 
     def _seed_noise(self, seed, width, height):
@@ -459,12 +488,17 @@ class Krea2RepairEngine:
         from fizgig.repair_studio.state import SliderState
         key = (self.primary_path, state.seed, state.prompt,
                state.preview_width, state.preview_height,
-               getattr(state, "ref_image_path", ""), round(float(getattr(state, "ref_megapixels", 1.0)), 4))
+               getattr(state, "ref_image_path", ""), round(float(getattr(state, "ref_megapixels", 1.0)), 4),
+               round(float(getattr(state, "primary_scale", 1.0)), 4),
+               round(float(getattr(state, "donor_scale", 1.0)), 4))
         if self._baseline_cache_key == key and self._baseline_cache_image is not None:
             return self._baseline_cache_image
         base = SliderState.default_krea2()
         base.seed = state.seed
         base.prompt = state.prompt
+        # The baseline is the LoRA at its LOAD strength with every slider at 1.0.
+        base.primary_scale = float(getattr(state, "primary_scale", 1.0))
+        base.donor_scale = float(getattr(state, "donor_scale", 1.0))
         base.preview_width = state.preview_width
         base.preview_height = state.preview_height
         # Same reference as the tweaked side, so the comparison differs only by the slider tweaks.
@@ -511,9 +545,11 @@ class Krea2RepairEngine:
     # ----- teardown ----------------------------------------------------------
     def reset(self) -> None:
         """Full unload — drop networks (break forward-hook ref cycles) then the Turbo + VAE."""
+        from fizgig.utils.device import release_module_tensors as _strip
         for net in (self.primary_network, self.donor_network):
             if net is not None:
                 try:
+                    _strip(net)     # husk the LoRA weights too — see the H3 reset comment
                     for lora in net.unet_loras:
                         lora.org_forward = None
                     net.unet_loras.clear()
@@ -521,6 +557,11 @@ class Krea2RepairEngine:
                     pass
         self.primary_network = None
         self.donor_network = None
+        # Same defense as the H3 engine: if anything outside the engine pins the module
+        # graph, dropping our reference leaks the VRAM — strip the storages first.
+        from fizgig.utils.device import release_module_tensors
+        release_module_tensors(self.turbo)
+        release_module_tensors(self.ae)
         self.turbo = None
         self.ae = None
         self.pipeline = None
@@ -539,3 +580,6 @@ class Krea2RepairEngine:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        from fizgig.utils.device import report_cuda_leak, flush_reserved_vram
+        report_cuda_leak("krea2-repair-reset")
+        flush_reserved_vram("krea2-repair-reset")

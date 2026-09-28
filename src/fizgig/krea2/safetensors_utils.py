@@ -85,6 +85,74 @@ def mem_eff_save_file(tensors: Dict[str, torch.Tensor], filename: str, metadata:
                 v.contiguous().view(torch.uint8).numpy().tofile(f)
 
 
+def stream_save_file(specs, filename: str, metadata: Dict[str, Any] = None):
+    """Write a safetensors file from LAZY tensor producers — one tensor in memory at a time.
+
+    mem_eff_save_file above streams the WRITE but still takes the whole dict of tensors in
+    RAM. Rotation fine-tune saves can't afford that: overlaying a ~21 GB checkpoint while a
+    ~38 GB bf16 master is resident would crowd a 64 GB box. The safetensors format needs the
+    full header (dtype/shape/offsets) before the first payload byte, but shapes are known
+    without materializing anything — so the caller declares them up front and each tensor is
+    produced only when it is that key's turn to hit the disk, then freed.
+
+    specs: ordered dict {key: (torch_dtype, shape_tuple, producer)} where producer is a
+    zero-arg callable returning the tensor (any device; CUDA tensors are copied via CPU on
+    write). Produced dtype/shape are asserted against the declaration — a mismatch would
+    silently corrupt every later offset in the file.
+
+    Atomicity is the CALLER's job (write to path+'.tmp', os.replace) — same contract as
+    _save_full_checkpoint."""
+    _TYPES = {
+        torch.float64: "F64", torch.float32: "F32", torch.float16: "F16",
+        torch.bfloat16: "BF16", torch.int64: "I64", torch.int32: "I32",
+        torch.int16: "I16", torch.int8: "I8", torch.uint8: "U8", torch.bool: "BOOL",
+        getattr(torch, "float8_e5m2", None): "F8_E5M2",
+        getattr(torch, "float8_e4m3fn", None): "F8_E4M3",
+    }
+    _ALIGN = 256
+    _ELEM = {torch.float64: 8, torch.float32: 4, torch.float16: 2, torch.bfloat16: 2,
+             torch.int64: 8, torch.int32: 4, torch.int16: 2, torch.int8: 1,
+             torch.uint8: 1, torch.bool: 1,
+             getattr(torch, "float8_e5m2", None): 1,
+             getattr(torch, "float8_e4m3fn", None): 1}
+
+    header = {}
+    offset = 0
+    if metadata:
+        header["__metadata__"] = {str(k): str(v) for k, v in metadata.items()}
+    for k, (dt, shape, _p) in specs.items():
+        numel = 1
+        for d in shape:
+            numel *= int(d)
+        size = numel * _ELEM[dt]
+        header[k] = {"dtype": _TYPES[dt], "shape": [int(d) for d in shape],
+                     "data_offsets": [offset, offset + size]}
+        offset += size
+
+    hjson = json.dumps(header).encode("utf-8")
+    hjson += b" " * (-(len(hjson) + 8) % _ALIGN)
+
+    with open(filename, "wb") as f:
+        f.write(struct.pack("<Q", len(hjson)))
+        f.write(hjson)
+        for k, (dt, shape, producer) in specs.items():
+            v = producer()
+            if v.dtype != dt or tuple(v.shape) != tuple(shape):
+                raise RuntimeError(
+                    f"stream_save_file: producer for {k!r} returned "
+                    f"{v.dtype}/{tuple(v.shape)}, declared {dt}/{tuple(shape)} — "
+                    "every later offset in the file would be wrong")
+            if v.numel() == 0:
+                continue
+            if v.dim() == 0:
+                v = v.unsqueeze(0)
+            v = v.contiguous()
+            if v.is_cuda:
+                v = v.cpu()
+            v.view(torch.uint8).numpy().tofile(f)
+            del v
+
+
 class MemoryEfficientSafeOpen:
     """Memory-efficient reader for safetensors files.
 
@@ -289,6 +357,70 @@ class MemoryEfficientSafeOpen:
         else:
             # Float8 not supported in this PyTorch version
             raise ValueError(f"Unsupported float8 type: {dtype_str} (upgrade PyTorch to support float8 types)")
+
+
+class ShardedSafeOpen:
+    """A directory of sharded safetensors behind the MemoryEfficientSafeOpen interface.
+
+    Hugging Face serves large checkpoints as `model-0000N-of-0000M.safetensors` plus an index,
+    while every streaming loader here takes a single file. This adapts one to the other, so a
+    loader can accept either by dispatching on os.path.isdir.
+
+    Shards are opened lazily and kept open: a loader that walks named_parameters() in module
+    order touches each shard's keys contiguously, so this is a handful of file handles, not a
+    reopen per tensor. The index is trusted when present; without one the headers are read
+    (cheap — a header is a few tens of KB regardless of shard size).
+    """
+
+    def __init__(self, dirname: str, disable_numpy_memmap: bool = False):
+        self.dirname = dirname
+        self.disable_numpy_memmap = disable_numpy_memmap
+        self._readers: Dict[str, "MemoryEfficientSafeOpen"] = {}
+
+        entries = sorted(os.listdir(dirname))
+        index = [e for e in entries if e.endswith(".safetensors.index.json")]
+        if index:
+            with open(os.path.join(dirname, index[0]), "r", encoding="utf-8") as fh:
+                self.weight_map = json.load(fh)["weight_map"]
+        else:
+            shards = [e for e in entries if e.endswith(".safetensors")]
+            if not shards:
+                raise FileNotFoundError(f"{dirname}: no .safetensors shards")
+            self.weight_map = {}
+            for shard in shards:
+                with MemoryEfficientSafeOpen(os.path.join(dirname, shard)) as f:
+                    for key in f.keys():
+                        self.weight_map[key] = shard
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        for reader in self._readers.values():
+            reader.file.close()
+        self._readers.clear()
+
+    def _reader(self, shard: str) -> "MemoryEfficientSafeOpen":
+        reader = self._readers.get(shard)
+        if reader is None:
+            reader = MemoryEfficientSafeOpen(os.path.join(self.dirname, shard), self.disable_numpy_memmap)
+            self._readers[shard] = reader
+        return reader
+
+    def keys(self):
+        return list(self.weight_map.keys())
+
+    def metadata(self) -> Dict[str, str]:
+        merged: Dict[str, str] = {}
+        for shard in dict.fromkeys(self.weight_map.values()):
+            merged.update(self._reader(shard).metadata())
+        return merged
+
+    def get_tensor(self, key: str, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None):
+        shard = self.weight_map.get(key)
+        if shard is None:
+            raise KeyError(f"{key} is not in any shard of {self.dirname}")
+        return self._reader(shard).get_tensor(key, device=device, dtype=dtype)
 
 
 def load_safetensors(

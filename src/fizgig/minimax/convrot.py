@@ -78,6 +78,43 @@ def dequantize_int8_convrot(qweight: torch.Tensor, scale: torch.Tensor, conf: di
     return rotate(w, group).to(out_dtype)
 
 
+def quantize_int8_convrot(w: torch.Tensor, rot: int = 256, stochastic: bool = False,
+                          generator: torch.Generator = None):
+    """The ENCODE direction — a TRUE-basis dense weight -> int8 codes + per-row scale.
+
+    Exists for rotation fine-tuning: a trained bf16 window is written back into the frozen
+    model's int8-ConvRot storage. Inverse of dequantize_int8_convrot: rotate into the storage
+    basis (self-inverse Hadamard, same call), then symmetric per-output-row absmax scaling to
+    the int8 grid. Round-trip property the tests pin: encoding a freshly DECODED weight
+    reproduces the original codes exactly — the codes are integers on their own grid and the
+    rowmax recovers the scale. clamp_min guards an all-zero row (a dead output would
+    otherwise divide by zero).
+
+    stochastic=True is the FT-save mode. Nearest rounding is systematically biased back to
+    the base's codes: a training delta below the grid step rounds HOME, so a fine-tune's
+    0.2-1% weight movement saved with nearest carries near-zero training signal (measured:
+    direction-cosine 0.02 at a 0.3% delta). Stochastic rounding rounds each weight up/down
+    with probability equal to its fractional position — per-weight ±1-code dither (the
+    error class the base already carries) but the delta is preserved IN EXPECTATION, and
+    the network integrates the coherent delta while averaging out the random dither
+    (measured: cosine 0.36 at 0.3%, ~10x the weight-space SNR of the NF4 trunk that
+    in-training previews render likeness through). Weights exactly ON the grid have zero
+    fractional part, so untouched tensors still roundtrip byte-exact.
+
+    Returns (codes int8 [out, in], scale fp32 [out, 1])."""
+    wr = rotate(w.to(torch.float32), rot)
+    s = wr.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / 127.0
+    v = wr / s
+    if stochastic:
+        fl = torch.floor(v)
+        rdev = generator.device if generator is not None else v.device
+        r = torch.rand(v.shape, generator=generator, device=rdev).to(v.device)
+        q = (fl + (r < (v - fl)).to(v.dtype)).clamp(-127, 127).to(torch.int8)
+    else:
+        q = torch.round(v).clamp(-127, 127).to(torch.int8)
+    return q, s
+
+
 class _Int8RotLinearFn(torch.autograd.Function):
     """linear(rotate(x), dequant(q, s)) that does NOT keep the dequantized weight alive.
 
@@ -91,18 +128,118 @@ class _Int8RotLinearFn(torch.autograd.Function):
     Net effect: this stores less than an ordinary Linear would.
     """
 
+    # rintic-13's fused W8A16 Triton GEMM (#89) — test-branch default ON. Opt out with
+    # FIZGIG_NO_TRITON_W8A16=1. Falls back to the eager path when Triton is missing, the
+    # input is not CUDA-bf16, or the kernel ever raises (logged once).
+    _w8a16_state = {"checked": False, "use": False, "announced": False}
+    # @mabseyuk's fused W8A16 BACKWARD GEMM (convrot_w8a16_backward_triton.py)
+    # — ON by default on the int8 base (Peter, 7 Sep 2026: measured +2-8% per step, never
+    # negative, across 32 GB / streamed / 0.5 MP runs), opt OUT with
+    # FIZGIG_NO_TRITON_W8A16_BACKWARD=1. It only ever runs alongside the forward kernel: on
+    # its own it measured slightly slower than eager, so the forward's opt-out covers both.
+    # Same fallback rules as the forward.
+    _w8a16_bwd_state = {"checked": False, "use": False, "announced": False}
+
+    @classmethod
+    def _use_w8a16_backward(cls, grad_out, dt):
+        st = cls._w8a16_bwd_state
+        if not st["checked"]:
+            st["checked"] = True
+            import os as _os
+            if (_os.environ.get("FIZGIG_NO_TRITON_W8A16_BACKWARD") != "1"
+                    and cls._w8a16_state["checked"] and cls._w8a16_state["use"]):
+                try:
+                    from fizgig.minimax.convrot_w8a16_backward_triton import TRITON_AVAILABLE
+                    st["use"] = bool(TRITON_AVAILABLE)
+                except Exception:
+                    st["use"] = False
+        if not (st["use"] and dt == torch.bfloat16 and grad_out.is_cuda
+                and grad_out.dtype == torch.bfloat16):
+            return False
+        if not st["announced"]:
+            st["announced"] = True
+            print("[convrot] fused W8A16 Triton BACKWARD kernel active (@mabseyuk) "
+                  "— opt out with FIZGIG_NO_TRITON_W8A16_BACKWARD=1", flush=True)
+        return True
+
+    @classmethod
+    def _use_w8a16(cls, x, dt, training):
+        st = cls._w8a16_state
+        if not st["checked"]:
+            st["checked"] = True
+            import os as _os
+            if _os.environ.get("FIZGIG_NO_TRITON_W8A16") == "1":
+                st["use"] = False
+            else:
+                try:
+                    from fizgig.minimax.convrot_w8a16_triton import TRITON_AVAILABLE
+                    st["use"] = bool(TRITON_AVAILABLE)
+                except Exception:
+                    st["use"] = False
+        # Training steps only: previews run under no_grad on razor-thin margins (56-frame
+        # clips at 11 GB free), where Triton's first-use overhead — JIT cubins, autotune
+        # benchmarking, context growth outside torch's allocator — tipped a working preview
+        # into OOM (field). The kernel buys nothing in a 6-step preview anyway; the win is
+        # the thousands of training forwards.
+        #
+        # `training` is ctx.needs_input_grad[0], NOT torch.is_grad_enabled(): PyTorch runs a
+        # custom Function's forward with grad mode OFF, so the grad-mode test was always False
+        # here and the kernel silently never ran in training (found 7 Sep 2026 while landing
+        # the backward kernel). Whether the input wants a gradient is the signal that tells a
+        # training forward from a preview, and it is visible inside forward().
+        if not (st["use"] and dt == torch.bfloat16 and x.is_cuda and training):
+            return False
+        if not st["announced"]:
+            st["announced"] = True
+            print("[convrot] fused W8A16 Triton kernel active (issue #89, rintic-13)",
+                  flush=True)
+        return True
+
     @staticmethod
     def forward(ctx, x, qdata, wscale, bias, rot, dt):
         ctx.save_for_backward(qdata, wscale)
         ctx.rot, ctx.dt = rot, dt
         xr = rotate(x.to(dt), rot) if rot > 1 else x.to(dt)
-        return torch.nn.functional.linear(xr, qdata.to(dt) * wscale.to(dt), bias)
+        if _Int8RotLinearFn._use_w8a16(xr, dt, bool(ctx.needs_input_grad[0])):
+            try:
+                from fizgig.minimax.convrot_w8a16_triton import fused_w8a16_gemm
+                return fused_w8a16_gemm(xr, qdata, wscale, bias)
+            except Exception as _ke:
+                _Int8RotLinearFn._w8a16_state["use"] = False
+                print(f"[convrot] W8A16 kernel failed ({type(_ke).__name__}: {_ke}) — "
+                      "falling back to the eager path for the rest of the run.", flush=True)
+        # Scale on the OUTPUT, not the weight. wscale is per output ROW, so
+        #     y[t,o] = sum_i xr[t,i]*q[o,i]*s[o] = (xr @ q^T)[t,o] * s[o]
+        # is exact, and it buys two things. The int8 CODES are integers <= 127, so they survive
+        # the bf16 cast bit-for-bit; the fp32 SCALES do not — measured 0.137% mean / 0.388% max
+        # relative error per row on the real checkpoint, i.e. a systematic per-output-channel
+        # GAIN error on all 200 block linears, every block, every step. Applying s in fp32 to a
+        # [tokens, out] tensor removes it. It also means no dequantized [out, in] weight is
+        # materialized at all, which is the 308 MB-per-layer transient this Function exists to
+        # avoid. Structurally this is also what ComfyUI's int8 kernel does: accumulate, then
+        # apply the fp32 scale.
+        y = torch.nn.functional.linear(xr, qdata.to(dt))
+        y = (y.float() * wscale.reshape(-1).float()).to(dt)
+        return y if bias is None else y + bias.to(dt)
 
     @staticmethod
     def backward(ctx, grad_out):
         qdata, wscale = ctx.saved_tensors
-        w = qdata.to(ctx.dt) * wscale.to(ctx.dt)          # recomputed, then freed
-        gx = grad_out.to(ctx.dt) @ w                       # [..., out] @ [out, in]
+        # grad_x = grad_out @ W = grad_out @ (q * s) = (grad_out * s) @ q — same identity, so
+        # the [out, in] weight is never rebuilt here either.
+        gx = None
+        if _Int8RotLinearFn._use_w8a16_backward(grad_out, ctx.dt):
+            try:
+                from fizgig.minimax.convrot_w8a16_backward_triton import fused_w8a16_input_grad
+                gx = fused_w8a16_input_grad(grad_out, qdata, wscale)
+            except Exception as _ke:
+                _Int8RotLinearFn._w8a16_bwd_state["use"] = False
+                print(f"[convrot] W8A16 backward kernel failed ({type(_ke).__name__}: {_ke}) — "
+                      "falling back to the eager backward for the rest of the run.", flush=True)
+                gx = None
+        if gx is None:
+            gs = (grad_out.float() * wscale.reshape(-1).float()).to(ctx.dt)
+            gx = gs @ qdata.to(ctx.dt)                     # [..., out] @ [out, in]
         if ctx.rot > 1:
             gx = rotate(gx, ctx.rot)                       # H is symmetric: R^T == R
         return gx, None, None, None, None, None

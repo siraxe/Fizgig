@@ -85,6 +85,14 @@ def precalculate_safetensors_hashes(state_dict):
     return f"0x{hash_sha256.hexdigest()}"
 
 
+def _described_family(architecture):
+    try:
+        from fizgig.families.registry import by_arch_id
+        return by_arch_id(architecture)
+    except Exception:
+        return None
+
+
 def build_metadata(
     state_dict: Optional[dict],
     architecture: str,
@@ -122,6 +130,11 @@ def build_metadata(
     elif architecture == ARCHITECTURE_MINIMAX:
         arch = ARCH_MINIMAX
         impl = IMPL_MINIMAX
+    elif _described_family(architecture) is not None:
+        # families added through the standard layer (fizgig.families) carry their own modelspec names
+        _fam = _described_family(architecture)
+        arch = _fam.modelspec_arch
+        impl = _fam.implementation
     else:
         raise ValueError(f"Unknown architecture: {architecture}")
 
@@ -204,6 +217,55 @@ def latest_sample_image(output_dir: Optional[str]) -> Optional[str]:
     if not candidates:
         return None
     return max(candidates, key=os.path.getmtime)
+
+
+def sample_for_epoch(output_dir: Optional[str], output_name: Optional[str], epoch: int) -> Optional[str]:
+    """The newest preview written for THIS epoch (`<name>_e{epoch:06d}_*`), or None.
+
+    `latest_sample_image` picks whatever is newest on disk, which at checkpoint-save time is
+    the PREVIOUS epoch's preview — the epoch checkpoint is saved before its own preview renders
+    (#122: every checkpoint's thumbnail was one epoch behind). This picks by epoch number."""
+    if not output_dir or not output_name:
+        return None
+    sample_dir = os.path.join(output_dir, "sample")
+    if not os.path.isdir(sample_dir):
+        return None
+    prefix = f"{output_name}_e{int(epoch):06d}_"
+    exts = (".png", ".jpg", ".jpeg", ".webp")
+    candidates = [os.path.join(sample_dir, f) for f in os.listdir(sample_dir)
+                  if f.startswith(prefix) and f.lower().endswith(exts)]
+    return max(candidates, key=os.path.getmtime) if candidates else None
+
+
+def refresh_checkpoint_thumbnail(lora_path: str, image_path: str) -> bool:
+    """Re-embed `modelspec.thumbnail` in an already-saved checkpoint from `image_path`.
+
+    Used after an epoch's preview renders, so the checkpoint saved a moment earlier carries
+    its OWN epoch's picture rather than the previous one's. Tensors are untouched; the file is
+    rewritten atomically (tmp + replace). Best-effort — a failure logs and leaves the file."""
+    uri = thumbnail_data_uri(image_path)
+    if not uri or not lora_path or not os.path.exists(lora_path):
+        return False
+    try:
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+        tensors, meta = {}, {}
+        with safe_open(lora_path, framework="pt") as f:
+            meta = dict(f.metadata() or {})
+            for k in f.keys():
+                tensors[k] = f.get_tensor(k)
+        if meta.get("modelspec.thumbnail") == uri:
+            return True
+        meta["modelspec.thumbnail"] = uri
+        tmp = lora_path + ".thumb.tmp"
+        save_file(tensors, tmp, metadata=meta)
+        os.replace(tmp, lora_path)
+        logger.info("[thumbnail] %s now carries its own epoch's preview (%s)",
+                    os.path.basename(lora_path), os.path.basename(image_path))
+        return True
+    except Exception:
+        logger.warning("could not refresh the thumbnail of %s", lora_path, exc_info=True)
+        return False
 
 
 def thumbnail_data_uri(image_path: Optional[str], max_size: int = 512, quality: int = 85) -> Optional[str]:

@@ -58,26 +58,213 @@ def check_python_version():
     return True
 
 
+def conda_reason():
+    """Why this Python must not build the venv, or None. Conda ships its own Tk that cannot
+    see the system's fonts, so a venv made from it draws the GUI with missing text (#141)."""
+    env = os.environ.get("CONDA_DEFAULT_ENV") or os.environ.get("CONDA_PREFIX")
+    if env:
+        return f"a conda environment is active ({env})"
+    if any(tag in sys.version.lower() for tag in ("conda", "anaconda", "continuum")):
+        return "this Python was built by conda"
+    for prefix in (getattr(sys, "base_prefix", ""), sys.prefix):
+        if prefix and os.path.isdir(os.path.join(prefix, "conda-meta")):
+            return "this Python was built by conda"
+    return None
+
+
+def check_not_conda():
+    """Refuse to build the venv from a conda Python (override: FIZGIG_ALLOW_CONDA=1)."""
+    if os.environ.get("FIZGIG_ALLOW_CONDA"):
+        print("FIZGIG_ALLOW_CONDA set — continuing inside conda (the GUI's fonts may render wrong).")
+        return True
+    reason = conda_reason()
+    if not reason:
+        print("Not a conda Python (OK)")
+        return True
+    print(f"Error: {reason}.")
+    print("Fizgig has to be installed from your system Python, not conda: conda bundles its own")
+    print("Tk, which cannot see the system's fonts, so the app comes up with missing or")
+    print("substituted text. Leave conda, then run the installer again:")
+    print("    conda deactivate")
+    print("    python3 install_fizgig.py      (Windows: py install_fizgig.py)")
+    print("If 'python3' is still conda's after that (conda on your PATH for good), run the")
+    print("system interpreter by its full path instead, e.g. /usr/bin/python3 install_fizgig.py")
+    print("(Windows: a python.org install, then py install_fizgig.py).")
+    print("To go ahead inside conda anyway, set FIZGIG_ALLOW_CONDA=1.")
+    return False
+
+
+def _is_conda_home(home):
+    """Was a venv's pyvenv.cfg `home` a conda Python? Off under FIZGIG_ALLOW_CONDA, or the
+    venv the override just created would be condemned by the health check straight after."""
+    if os.environ.get("FIZGIG_ALLOW_CONDA"):
+        return False
+    h = Path(home)
+    for p in (h, h.parent):
+        if (p / "conda-meta").is_dir():
+            return True
+    # Whole path COMPONENTS only: a parent folder that merely contains the word (a user
+    # called conda-dev, a project dir named conda_tools) must not condemn a plain venv.
+    for part in (p.lower() for p in h.parts):
+        if part in ("conda", "anaconda", "miniconda", "miniforge", "mambaforge") or any(
+                part.startswith(tag) and part[len(tag):].isdigit()
+                for tag in ("anaconda", "miniconda", "miniforge", "mambaforge")):
+            return True
+    return False
+
+
+def venv_health(venv_dir=None):
+    """Why an existing venv can't be trusted — None when it's fine, else (kind, reason).
+
+    kind 'broken' means reuse cannot work (missing interpreter, orphaned base, won't
+    boot) — declining recreation has to abort. kind 'mismatch' means the venv boots
+    fine but was built from a different Python than the one running this installer —
+    the shape that produced #111, where a venv from an original 3.10 install was
+    retried against 3.10-3.13, reused every time because the recreate prompt defaults
+    to No, and a leftover 32-bit Python 3.7 then booted inside uv's interpreter probe
+    and died at 'No module named encodings'. Recreation is the safe default there, but
+    a mismatched venv that has been working is allowed to keep working (review round:
+    every dependency install runs through the venv's OWN python, so "reuse would fail"
+    is not a promise this function can make) — which is why the boot probe runs FIRST
+    and outranks the version string.
+
+    The probe uses '-I' (isolated mode) deliberately: that is how uv queries the
+    interpreter, and #111's venv passed a plain spawn while failing exactly that."""
+    venv_dir = Path(venv_dir) if venv_dir else VENV_DIR
+    python_path = venv_dir / ("Scripts/python.exe" if platform.system() == "Windows"
+                              else "bin/python")
+    if not python_path.exists():
+        return ("broken", "its Python executable is missing")
+
+    home = version = None
+    cfg = venv_dir / "pyvenv.cfg"
+    if cfg.exists():
+        try:
+            for line in cfg.read_text(encoding="utf-8", errors="replace").splitlines():
+                key, _, value = line.partition("=")
+                key, value = key.strip().lower(), value.strip()
+                if key == "home":
+                    home = value
+                elif key in ("version", "version_info"):
+                    version = value
+        except OSError:
+            pass
+    if home and not Path(home).exists():
+        # Only the whole home directory vanishing counts — probing for a specific
+        # executable name inside it would false-positive on Unix layouts where the
+        # binary is python3, and a wrongly-condemned venv is worse than a missed one.
+        return ("broken", f"it was built from a Python that is no longer installed ({home})")
+    if home and _is_conda_home(home):
+        return ("broken", f"it was built from a conda Python ({home}) — conda's Tk cannot see "
+                          "the system's fonts, so Fizgig needs a venv from the system Python")
+
+    try:
+        result = subprocess.run(
+            [str(python_path), "-I", "-c", "import encodings"],
+            capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            return ("broken", "its Python cannot start in isolated mode — the way the "
+                              "package installer runs it — usually because another "
+                              "Python installation is interfering")
+    except (OSError, subprocess.TimeoutExpired):
+        return ("broken", "its Python cannot be started at all")
+
+    if version:
+        parts = version.split(".")
+        # Digits-only guard: a hand-mangled cfg ('version = ..') must not condemn a
+        # venv the probe just proved bootable with a nonsense comparison.
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            built = f"{parts[0]}.{parts[1]}"
+            running = f"{sys.version_info[0]}.{sys.version_info[1]}"
+            if built != running:
+                return ("mismatch", f"it was built from Python {built}, but this "
+                                    f"installer is running Python {running}")
+    return None
+
+
+def _remove_venv(venv_dir=None):
+    """rmtree with a plain-language failure instead of a traceback — on Windows a
+    locked file (Fizgig still open, a terminal with the venv activated, an antivirus
+    scan) is the common way this dies, and it can leave a half-deleted venv behind."""
+    venv_dir = Path(venv_dir) if venv_dir else VENV_DIR
+    try:
+        shutil.rmtree(venv_dir)
+        return True
+    except OSError as e:
+        print(f"Could not remove the venv: {e}")
+        print("Close Fizgig and any terminal windows using this venv, then run the "
+              "installer again. (A partially removed venv is fine — the next run "
+              "detects it and finishes the job.)")
+        return False
+
+
 def create_venv():
     """Create virtual environment"""
     if VENV_DIR.exists():
         print(f"Virtual environment already exists at: {VENV_DIR}")
-        response = input("Delete and recreate? (y/N): ").strip().lower()
-        if response == 'y':
-            print("Removing existing venv...")
-            shutil.rmtree(VENV_DIR)
+        health = venv_health()
+        if health:
+            # An untrusted venv must not be the default choice — the y/N prompt below
+            # kept #111's venv alive through every retry the user made.
+            kind, reason = health
+            print(f"But {reason}.")
+            if kind == "broken":
+                print("Reusing it cannot work, so it needs recreating.")
+                response = input("Delete and recreate it now? (Y/n): ").strip().lower()
+                if response in ("n", "no"):
+                    print("Cannot continue with this venv. Delete the folder manually "
+                          "(or answer Y here) and run the installer again.")
+                    return False
+            else:
+                # mismatch: it boots, and dependency installs run through the venv's
+                # own python — so it MAY keep working. Recreating is still the safe
+                # default (a version-straddling venv is exactly the #111 trap), but
+                # the cost is honest and declining continues rather than aborts.
+                print("Recreating it is the safe choice — a venv reused across Python "
+                      "versions is a common source of confusing install failures — but "
+                      "it does mean re-downloading all packages (several GB). If this "
+                      "venv has been working for you, answering n keeps it.")
+                response = input("Delete and recreate it now? (Y/n): ").strip().lower()
+                if response in ("n", "no"):
+                    print("Keeping the existing venv.")
+                    return True
+            print("Removing venv...")
+            if not _remove_venv():
+                return False
         else:
-            print("Using existing venv.")
-            return True
+            response = input("Delete and recreate? (y/N): ").strip().lower()
+            if response == 'y':
+                print("Removing existing venv...")
+                if not _remove_venv():
+                    return False
+            else:
+                print("Using existing venv.")
+                return True
 
     print(f"Creating virtual environment at: {VENV_DIR}")
     try:
         subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)], check=True)
-        print("Virtual environment created successfully.")
-        return True
     except subprocess.CalledProcessError as e:
         print(f"Error creating venv: {e}")
         return False
+    health = venv_health()
+    if health and health[0] == "broken":
+        # A fresh venv can only be 'broken' here (its cfg version matches by
+        # construction) — but guard on kind anyway so a future check can't turn
+        # a working new venv into a hard stop.
+        print(f"The new virtual environment was created, but {health[1]}.")
+        if platform.system() == "Windows":
+            print("This usually means a stray older Python is getting in the way — "
+                  "check for old installations (especially 32-bit ones, e.g. in "
+                  "'C:\\Program Files (x86)') and uninstall them or remove them from "
+                  "PATH, then run this installer again from a new terminal.")
+        else:
+            print("This usually means another Python installation is getting in the "
+                  "way — check PATH for stray or partial Python installs, then run "
+                  "this installer again from a new shell.")
+        return False
+    print("Virtual environment created successfully.")
+    return True
 
 
 def get_pip_path():
@@ -112,21 +299,11 @@ def install_dependencies():
     print(f"Installing dependencies from: {REQUIREMENTS_FILE} (using uv)")
     print("(This may take a few minutes for PyTorch download...)")
 
-    try:
-        # shell=False (list form) with internal Path constants — not injectable.
-        # --link-mode=copy: the uv cache and the venv are often on different drives
-        # (e.g. cache on C:, install on S:), where hardlinking isn't possible — copy
-        # mode avoids the noisy "Failed to hardlink" warning.
-        subprocess.run(
-            [str(python_path), "-m", "uv", "pip", "install", "--link-mode", "copy",
-             "--index-strategy", "unsafe-best-match", "-r", str(REQUIREMENTS_FILE)],
-            check=True
-        )
+    from uv_install_deps import install_requirements
+    if install_requirements(REQUIREMENTS_FILE, VENV_DIR, python_path):
         print("Dependencies installed successfully.")
         return True
-    except subprocess.CalledProcessError as e:
-        print(f"Error installing dependencies: {e}")
-        return False
+    return False
 
 
 def verify_cuda():
@@ -233,11 +410,16 @@ def create_launcher_scripts():
     that ended in 'Press any key to continue', and (b) dirtied a tracked file so the next
     update_fizgig.bat's `git pull` refused to run. Never write it here.
     """
-    bat_path = SCRIPT_DIR / "run_fizgig.bat"
-    if bat_path.exists():
-        print(f"Launcher present: {bat_path} (ships with the repo — not modified)")
-    else:
-        print(f"WARNING: {bat_path} is missing — restore it with `git checkout -- run_fizgig.bat`")
+    # Gizmo's launcher is the same story and gets the same treatment: tracked, verified, never
+    # written. It needs no install of its own — Tkinter is stdlib, PIL and imageio-ffmpeg are
+    # already pinned — so it simply arrives with an ordinary update.
+    for name in ("run_fizgig.bat", "Launch Gizmo (Video clip prep tool).bat"):
+        bat_path = SCRIPT_DIR / name
+        if bat_path.exists():
+            print(f"Launcher present: {bat_path} (ships with the repo — not modified)")
+        else:
+            print(f"WARNING: {bat_path} is missing — restore it with "
+                  f'`git checkout -- "{name}"`')
 
     # Linux/Mac shell script (not shipped in the repo — generated here)
     sh_content = '''#!/bin/bash
@@ -332,13 +514,56 @@ def check_msvc_build_tools():
     print("  detects it automatically.")
 
 
+def _windows_has_amd_radeon() -> bool:
+    """Best-effort AMD detect for the hand-off message (PowerShell CIM)."""
+    ps = (
+        "Get-CimInstance Win32_VideoController | "
+        "Select-Object -ExpandProperty Name"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            text = result.stdout or ""
+            return "AMD" in text and "Radeon" in text
+    except Exception:
+        pass
+    return False
+
+
+def redirect_amd_to_rocm_installer():
+    """AMD support is additive: leave the CUDA path untouched and hand off early."""
+    if platform.system() == "Linux":
+        has_nvidia = os.path.exists("/dev/nvidia0") or bool(shutil.which("nvidia-smi"))
+        if os.path.exists("/dev/kfd") and not has_nvidia:
+            print("AMD ROCm detected. This installer is NVIDIA CUDA only.")
+            print("Use the separate AMD installer (Linux AMD is highly experimental):")
+            print(f"  chmod +x {SCRIPT_DIR / 'install_fizgig_rocm.sh'}")
+            print(f"  {SCRIPT_DIR / 'install_fizgig_rocm.sh'}")
+            sys.exit(1)
+        return
+
+    if platform.system() == "Windows":
+        if shutil.which("nvidia-smi"):
+            return
+        if _windows_has_amd_radeon():
+            print("AMD GPU detected. This installer is NVIDIA CUDA only.")
+            print("Use the separate AMD installer:")
+            print(f"  {SCRIPT_DIR / 'install_fizgig_rocm.bat'}")
+            sys.exit(1)
+
+
 def main():
     print_header("Fizgig Installer — Klein 9B & Krea 2 LoRA Workbench")
     print(f"Installation directory: {SCRIPT_DIR}")
 
-    # Step 1: Check Python version
-    print_step(1, "Checking Python version")
-    if not check_python_version():
+    redirect_amd_to_rocm_installer()
+
+    # Step 1: Check Python version, and that it is not conda's (#141)
+    print_step(1, "Checking Python")
+    if not check_python_version() or not check_not_conda():
         sys.exit(1)
 
     # Step 2: Create virtual environment

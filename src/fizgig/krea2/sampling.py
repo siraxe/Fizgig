@@ -73,6 +73,25 @@ def gather_valid_text(txt, mask):
     return out, newmask
 
 
+def patchify_block(img, patch, frame=0.0):
+    """One image block -> (tokens, pos, mask), positions on the 3-axis RoPE grid.
+
+    `frame` writes the FIRST RoPE axis (32 head-dims are allocated to it; every existing path
+    uses 0). In-context conditioning places a clean reference at frame=1 — the convention the
+    krea2_edit ecosystem trained (source distinguished from target purely by this axis)."""
+    b, _, h, w = img.shape
+    h_, w_ = h // patch, w // patch
+    imgids = torch.zeros((h_, w_, 3), device=img.device)
+    if frame:
+        imgids[..., 0] = float(frame)
+    imgids[..., 1] = torch.arange(h_, device=img.device)[:, None]
+    imgids[..., 2] = torch.arange(w_, device=img.device)[None, :]
+    imgpos = repeat(imgids, "h w three -> b (h w) three", b=b, three=3)
+    imgmask = torch.ones(b, h_ * w_, device=img.device, dtype=torch.bool)
+    tokens = rearrange(img, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch)
+    return tokens, imgpos, imgmask
+
+
 def prepare(img, txtlen, patch, txtmask):
     """Patchify the latent and build the combined image+text position / mask tensors.
 
@@ -80,19 +99,12 @@ def prepare(img, txtlen, patch, txtmask):
     ([img (all valid), text (valid prefix + padding)]), which the shared attention's
     varlen / cu_seqlens path requires. Returns (img_tokens, pos, mask).
     """
-    b, _, h, w = img.shape
-    h_, w_ = h // patch, w // patch
-    imgids = torch.zeros((h_, w_, 3), device=img.device)
-    imgids[..., 1] = torch.arange(h_, device=img.device)[:, None]
-    imgids[..., 2] = torch.arange(w_, device=img.device)[None, :]
-    imgpos = repeat(imgids, "h w three -> b (h w) three", b=b, three=3)
-    imgmask = torch.ones(b, h_ * w_, device=img.device, dtype=torch.bool)
-    img = rearrange(img, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch)
-
+    b = img.shape[0]
+    tokens, imgpos, imgmask = patchify_block(img, patch)
     txtpos = torch.zeros(b, txtlen, 3, device=img.device)
     mask = torch.cat((imgmask, txtmask), dim=1)
     pos = torch.cat((imgpos, txtpos), dim=1)
-    return img, pos, mask
+    return tokens, pos, mask
 
 
 def timesteps(seq_len, steps, x1, x2, y1=0.5, y2=1.15, sigma=1.0, mu=None):
@@ -161,6 +173,8 @@ def sample(
     mu=None,
     should_abort=None,
     noise=None,
+    before_decode=None,
+    after_decode=None,
 ):
     """Denoise pre-encoded text embeddings to images: euler+CFG denoise -> decode.
 
@@ -264,9 +278,25 @@ def sample(
     # Move the VAE to the latent's device for decode (it is kept on CPU otherwise to save VRAM),
     # then move it back to CPU so the next generation starts with the decode VRAM freed. The DiT
     # stays put on its device; the decode is expected to fit alongside it via fp8 / block swap.
-    ae = ae.to(img.device)
-    pixels = ae.decode_to_pixels(img.to(torch.bfloat16))
-    ae = ae.to("cpu")
+    # Hooks around the decode (#123): a caller that keeps the DiT resident can park it for the
+    # decode and put it back — on a 16 GB card the VAE joining a resident base at 1024 px is the
+    # spike that makes WDDM demote live training tensors, and nothing re-promotes them after.
+    # A decode that fails (an OOM, most likely) must not leave the VAE on the GPU or the parked
+    # training DiT on CPU: the restore runs whenever the park started, however the decode exits
+    # (spotted by @Linkram in PR #152).
+    parked = False
+    try:
+        if before_decode is not None:
+            parked = True
+            before_decode()
+        ae = ae.to(img.device)
+        pixels = ae.decode_to_pixels(img.to(torch.bfloat16))
+    finally:
+        try:
+            ae = ae.to("cpu")
+        finally:
+            if parked and after_decode is not None:
+                after_decode()
     pixels = rearrange(pixels * 255.0, "b c h w -> b h w c").cpu().byte().numpy()
     gc.collect()
     if torch.cuda.is_available():

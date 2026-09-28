@@ -26,6 +26,13 @@ you can terminate freely and attach the same storage to a new pod later. The cat
 region-locked, and the region you create it in may not have the GPU you want — so if you can't find
 a region with both, don't fight it. Take the Volume Disk and just stop rather than terminate.
 
+**Not a Global Volume.** RunPod's newer global volumes are object storage behind a mount, not a real
+filesystem: by RunPod's own documentation they can't set file permission bits, don't support file
+locking or atomic rename, and aren't recommended for workloads that write heavily. Fizgig needs all
+three — git can't even create the checkout there, and training writes a checkpoint every epoch. Mount
+one at `/workspace` and the pod restarts every few seconds with a fresh password in the log each time.
+Use a Volume Disk or a regional Network Volume.
+
 Either way, download the models once and every future session reuses them.
 
 ## Which GPU
@@ -83,6 +90,24 @@ as-is) and prints it at the **end of the log**, in the "Ready" banner:
 If the log looks like it stops short of that, switch to another tab and back — RunPod's log view
 sometimes needs a nudge before it shows the newest lines.
 
+### How the pod is secured
+
+Worth knowing, and worth writing down so it doesn't get "fixed" into something worse later.
+
+**The desktop always needs a password.** There is no unauthenticated mode — if you don't set
+`VNC_PASSWORD`, one is generated for that pod and printed in the log. An open VNC on a public URL
+is a shell on someone else's GPU, so this one isn't optional.
+
+**SSH is off unless you ask for it.** Port 22 is listed on the image as documentation, but nothing
+listens on it until `PUBLIC_KEY` is set, and then only your own key gets in. RunPod's "SSH Terminal
+Access" toggle sets that variable for you; on any other host you set it yourself.
+
+**Everything in the pod runs as root, deliberately.** A rented GPU has exactly one tenant — you —
+and logging in gives you a full desktop on it by design. Running the container as an unprivileged
+user would not change what you can do, would not help anyone who already had the password, and
+would break `/workspace` permissions on pods that already exist. The protection that matters here
+is the password on the door, not the user behind it.
+
 ## First run
 
 1. Connect on **port 6080** and log in
@@ -132,7 +157,7 @@ Environment variables, set on the deploy screen under **Edit Template**:
 |---|---|---|
 | `VNC_PASSWORD` | 12+ characters | Desktop *and* file manager. Generated per pod if unset. |
 | `HF_TOKEN` | `hf_…` | Only needed for Klein, which is gated. Krea 2 needs nothing. |
-| `FETCH_MODELS` | `krea2`, `klein`, `tools` — comma-separated | Download at boot instead of clicking the button in Preferences. `tools` is the Florence-2 captioner, the EN→ZH translator for bilingual captions, and the face model the Look Filter uses. |
+| `FETCH_MODELS` | `krea2`, `klein`, `minimax`, `tools` — comma-separated | Download at boot instead of clicking the button in Preferences. `minimax` includes the Circlestone and both Ostris training adapters. `tools` is the Florence-2 captioner, the EN→ZH translator for bilingual captions, and the face model the Look Filter uses. |
 | `FIZGIG_REF` | branch or tag | Which Fizgig to run. Defaults to `master`, so the app updates itself at every pod start. |
 
 Nothing is compulsory — the defaults are the intended setup, and everything here can be done from
@@ -153,6 +178,9 @@ login details.
 - **Downloads fail with "no space left"** — same cause: models are landing on container disk.
 - **Your models vanished** — the pod was *terminated* rather than *stopped*. A Volume Disk goes
   with its pod; stop it instead, or use a Network Volume if you need to terminate.
+- **Restarts every few seconds, a new generated password each time** — `/workspace` is a Global
+  Volume, which git can't clone onto (see Storage above). Switch it for a Volume Disk or a regional
+  Network Volume.
 
 Fizgig's own version and the image's are both shown in **Preferences → RunPod**; quote both if you
 report a problem, since the app updates itself independently of the image.

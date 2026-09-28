@@ -22,7 +22,52 @@ import shutil
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .gpu_backend import is_rocm
+
 logger = logging.getLogger(__name__)
+
+
+# torch major.minor -> the triton major.minor releases it is known to work with (the
+# version the Linux torch wheel depends on, and the one before it, which the field has
+# proven). A triton built for a newer torch imports fine and then fails or hangs INSIDE
+# torch.compile, so an import check alone lets it through — that is how a fresh install
+# with an unpinned triton-windows 3.8 on torch 2.10 stalled Krea 2 previews with no log.
+_TRITON_FOR_TORCH = {
+    "2.8": ("3.3", "3.4"),
+    "2.9": ("3.4", "3.5"),
+    "2.10": ("3.5", "3.6"),
+    "2.11": ("3.6", "3.7"),
+    "2.12": ("3.7", "3.8"),
+}
+
+
+def _major_minor(v: str) -> str:
+    parts = str(v or "").split("+")[0].split(".")
+    return ".".join(parts[:2]) if len(parts) >= 2 else str(v or "")
+
+
+def triton_matches_torch(triton_version=None, torch_version=None):
+    """(ok, note): whether this triton is one torch is known to work with. Unknown torch
+    versions are not gated (ok, ""). Versions default to the installed ones."""
+    try:
+        if torch_version is None:
+            import torch as _t
+            torch_version = _t.__version__
+        if triton_version is None:
+            import triton as _tr
+            triton_version = getattr(_tr, "__version__", "")
+    except Exception:
+        return True, ""
+    want = _TRITON_FOR_TORCH.get(_major_minor(torch_version))
+    if not want:
+        return True, ""
+    have = _major_minor(triton_version)
+    if have in want:
+        return True, ""
+    return False, (f"triton {triton_version} does not pair with torch {torch_version} "
+                   f"(torch {_major_minor(torch_version)} needs triton {' or '.join(want)}; "
+                   f"a mismatched triton fails inside torch.compile, sometimes silently) — "
+                   f"reinstall with: pip install \"triton-windows>={want[0]}.0,<{float(want[1]) + 0.1:.1f}\"")
 
 
 def has_host_c_compiler(platform: Optional[str] = None) -> bool:
@@ -38,6 +83,7 @@ def has_host_c_compiler(platform: Optional[str] = None) -> bool:
 @dataclass
 class Capabilities:
     has_cuda: bool = False
+    is_rocm: bool = False
     device_name: str = "cpu"
     sm: tuple = (0, 0)
     vram_gb: float = 0.0        # card total, as reported
@@ -52,8 +98,11 @@ class Capabilities:
 
     def summary(self) -> str:
         if not self.has_cuda:
-            return "no CUDA device"
-        flags = [f"sm_{self.sm[0]}{self.sm[1]}"]
+            return "no GPU device"
+        backend = "ROCm" if self.is_rocm else "CUDA"
+        flags = [backend]
+        if not self.is_rocm:
+            flags.append(f"sm_{self.sm[0]}{self.sm[1]}")
         used = self.vram_gb - self.vram_free_gb
         vram = (f"{self.vram_free_gb:.1f} GB free of {self.vram_gb:.0f} GB"
                 + (f" ({used:.1f} GB already in use)" if used > 1.0 else ""))
@@ -103,10 +152,11 @@ def detect() -> Capabilities:
         return caps
 
     if not torch.cuda.is_available():
-        caps.notes.append("CUDA unavailable")
+        caps.notes.append("GPU unavailable")
         return caps
 
     caps.has_cuda = True
+    caps.is_rocm = is_rocm()
     props = torch.cuda.get_device_properties(0)
     caps.device_name = props.name
     caps.sm = torch.cuda.get_device_capability(0)
@@ -121,15 +171,18 @@ def detect() -> Capabilities:
         caps.vram_free_gb = caps.vram_gb
         caps.notes.append("could not read free VRAM — using card total")
 
-    caps.fp8_matmul = _probe_scaled_mm(torch.float8_e4m3fn)
+    caps.fp8_matmul = _probe_scaled_mm(torch.float8_e4m3fn) if not caps.is_rocm else False
     caps.int8_matmul = _probe_scaled_mm(torch.int8)     # expected False: _scaled_mm is fp8-only
     caps.int8_matmul_train = _probe_int_mm()
 
-    try:    # cuDNN SDPA backend: present from PyTorch 2.5-ish, Ampere and newer
-        from torch.backends.cuda import can_use_cudnn_attention  # noqa: F401
-        caps.cudnn_attention = True
-    except Exception:
-        caps.cudnn_attention = hasattr(__import__("torch").backends.cuda, "cudnn_sdp_enabled")
+    if caps.is_rocm:
+        caps.cudnn_attention = False
+    else:
+        try:    # cuDNN SDPA backend: present from PyTorch 2.5-ish, Ampere and newer
+            from torch.backends.cuda import can_use_cudnn_attention  # noqa: F401
+            caps.cudnn_attention = True
+        except Exception:
+            caps.cudnn_attention = hasattr(__import__("torch").backends.cuda, "cudnn_sdp_enabled")
 
     try:
         import flash_attn  # noqa: F401
@@ -235,6 +288,203 @@ class MemoryStrategy:
     blocks_to_swap: int
     reason: str
     quant_int8: str = ""     # "" | "bf16" — W8A8 base with exact bf16 gradients
+
+
+# --- Rotating fine-tune window sizing ------------------------------------------------
+# Measured peak reserved VRAM on a 5090, 130 steps (past a rotation boundary — component's
+# peak IS the window switch, ~7 GB above steady state, so a shorter probe understates it
+# badly). Requirements add ~2 GB on top for the CUDA context, which torch's `reserved`
+# figure excludes, plus a little headroom.
+#
+#   component            27.67 GB   every window spans all 28 blocks (quality-preferred)
+#   block 8 + streaming  20.71 GB
+#   block 4 + streaming  18.70 GB
+#   block 2 + streaming  17.62 GB
+#
+# HISTORY (27 Aug): this table used to drive the auto pick, and its component row
+# excluded streaming on the reasoning that every block holds a trainable slice.
+# Depth-split component windows (the small-card tiers) dissolved that premise — an
+# out-of-window block is fully frozen and streamable — so auto now stays in component
+# mode at every depth (see recommend_ft_rotation) and the trainer's window planner
+# does the exact sizing at launch. The block rows remain for the explicit Window
+# dropdown choice, quality-untested as ever.
+FT_ROTATION_TIERS = [
+    # (min_free_gb, mode,        blocks, stream, measured_peak_gb)
+    (29.5, "component", 14, False, 27.67),
+    (22.5, "block",      8, True,  20.71),
+    (20.5, "block",      4, True,  18.70),
+    (19.5, "block",      2, True,  17.62),
+]
+
+# Component-mode auto ladder: (min_free_gb, stream, narrative). The window planner in
+# the trainer does the exact split arithmetic from the model's own Linear sizes; these
+# thresholds only decide the MODE and set expectations in the console.
+FT_COMPONENT_LADDER = [
+    (29.5, False, "full-depth component windows (the classic 4-window cycle)"),
+    (18.5, False, "component mode with depth-split windows — fat windows train in "
+                  "slices, still full speed"),
+    (12.5, True,  "component mode with depth-split windows + frozen-block streaming "
+                  "from RAM — steps slower for the PCIe trips"),
+]
+
+
+def recommend_ft_rotation(free_gb: Optional[float] = None):
+    """Pick a rotating fine-tune window config that fits the free VRAM.
+
+    Returns (mode, blocks_per_window, stream, reasons) where `reasons` is a list of lines
+    for the console. Budgets from FREE VRAM rather than card capacity, so another app
+    holding the GPU is accounted for.
+    """
+    if free_gb is None:
+        try:
+            # plannable_free_vram honours FIZGIG_SIM_VRAM_GB, so FT sizing is testable on
+            # the small-card simulator like every other planner (post-merge follow-up).
+            from fizgig.utils.device import plannable_free_vram
+            free_gb = plannable_free_vram()
+        except Exception:
+            free_gb = None
+    if free_gb is None:
+        return ("component", 14, False,
+                ["could not read free VRAM — falling back to component mode"])
+    try:
+        if is_rocm():
+            # Tiers were measured on a 5090; ROCm allocator behaviour differs enough that
+            # the numbers are advisory there. Don't refuse — warn.
+            logger.warning("[ft-rotation] tier table was measured on NVIDIA (5090); on ROCm "
+                           "treat the picked window as a starting point and watch VRAM.")
+    except Exception:
+        pass
+
+    # Component mode at every depth (27 Aug): depth-split windows made every card tier
+    # a component tier — block mode remains an explicit Window-dropdown choice only.
+    for min_free, stream, narrative in FT_COMPONENT_LADDER:
+        if free_gb >= min_free:
+            return ("component", 14, stream,
+                    [f"{free_gb:.1f} GB free -> {narrative}; the window planner sizes "
+                     "the exact splits at launch and prints them"])
+
+    lo = FT_COMPONENT_LADDER[-1]
+    return ("component", 14, True,
+            [f"{free_gb:.1f} GB free is below the ~{lo[0]:.1f} GB the smallest streamed "
+             "component plan was budgeted for — trying anyway; the window planner will "
+             "refuse cleanly if it truly cannot fit."])
+
+
+def _nvidia_smi_used_gb() -> Optional[float]:
+    """Total VRAM in use per the DRIVER (every process), in GB. None when unreadable
+    (no nvidia-smi on ROCm, or parsing failed) — callers treat None as 'guard is a no-op'."""
+    smi = shutil.which("nvidia-smi")
+    if smi is None:
+        return None
+    try:
+        import subprocess
+        out = subprocess.run([smi, "--query-gpu=memory.used",
+                              "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=15)
+        return int(out.stdout.strip().splitlines()[0]) / 1024.0
+    except Exception:
+        return None
+
+
+def wait_for_gpu_handoff(threshold_gb: float = 6.0, timeout_s: float = 180.0,
+                         poll_s: float = 5.0) -> None:
+    """Driver-level VRAM handoff guard — call BEFORE a fine-tune claims the card.
+
+    WDDM virtualizes memory per process, so the trainer's own mem_get_info can NEVER see a
+    just-finished trainer that is still tearing down (unwinding a ~38 GB Python heap takes
+    a while after the 'completed' line). Uploading a 21 GB base while the old process still
+    holds its copy overcommits the card, and WDDM's demotion to shared memory is STICKY —
+    the demoted blocks crawl when they first rotate in, so the slowdown surfaces mid-run
+    (field: epochs 6-7 of a back-to-back fine-tune), not at load. nvidia-smi reads the
+    driver's global view, which sees every process — so the guard runs there.
+
+    Must run before this process's first CUDA call: after CUDA init, our own context is
+    part of the total and the threshold arithmetic assumes we hold ~nothing yet."""
+    used = _nvidia_smi_used_gb()
+    if used is None or used < threshold_gb:
+        return
+    import time
+    logger.info(
+        "[ft-guard] another process is still holding ~%.1f GB of VRAM — waiting up to "
+        "%.0f s for it to let go. A just-finished fine-tune can take a minute to fully "
+        "exit; restarting Fizgig between fine-tunes always guarantees a clean handoff.",
+        used, timeout_s)
+    start = time.monotonic()
+    while time.monotonic() - start < timeout_s:
+        time.sleep(poll_s)
+        used = _nvidia_smi_used_gb()
+        if used is None or used < threshold_gb:
+            logger.info("[ft-guard] VRAM released after %.0f s — proceeding.",
+                        time.monotonic() - start)
+            return
+    logger.warning(
+        "[ft-guard] still ~%.1f GB held elsewhere after %.0f s — starting anyway. If this "
+        "run trains slow, close other GPU apps, or restart Fizgig between fine-tunes.",
+        used, timeout_s)
+
+
+def _available_ram_gb():
+    """(available_gb, total_gb) physical RAM, or (None, None) when unreadable."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            ms = _MS(dwLength=ctypes.sizeof(_MS))
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+            return ms.ullAvailPhys / 2**30, ms.ullTotalPhys / 2**30
+        with open("/proc/meminfo") as f:
+            info = {l.split(":")[0]: int(l.split()[1]) for l in f if ":" in l}
+        return info["MemAvailable"] / 2**20, info["MemTotal"] / 2**20
+    except Exception:
+        return None, None
+
+
+def wait_for_ram_recovery(timeout_s: float = 180.0, poll_s: float = 5.0) -> None:
+    """The RAM leg of the fine-tune handoff guard — call right after wait_for_gpu_handoff.
+
+    A single H3 fine-tune commits ~120 GB (bf16 master + CUDA's system-RAM backing under
+    WDDM + park arenas), and a just-finished one takes a while to hand that back. A second
+    fine-tune started into that teardown gets its master evicted to the pagefile AS IT IS
+    BUILT, and the evictions bite when each window first rotates in — measured in the field
+    as a crawl through cycle 1, worst at its last windows (epochs 6-7). Physical
+    availability climbs back within a minute or two of the old process dying, so waiting is
+    both observable and sufficient. Threshold: 40%% of total RAM (a 128 GB box waits for
+    ~51 GB — master + working margin; scales down for smaller boxes, where the run was
+    always going to lean on the pagefile anyway)."""
+    avail, total = _available_ram_gb()
+    if avail is None or total is None:
+        return
+    need = 0.40 * total
+    if avail >= need:
+        return
+    import time
+    logger.info(
+        "[ft-guard] only %.0f GB of %.0f GB RAM is available — a fine-tune wants ~%.0f GB "
+        "before its master builds, so waiting up to %.0f s for Windows to hand memory back "
+        "(a just-finished fine-tune releases ~120 GB and that takes a minute; restarting "
+        "Fizgig between fine-tunes always guarantees a clean handoff).",
+        avail, total, need, timeout_s)
+    start = time.monotonic()
+    while time.monotonic() - start < timeout_s:
+        time.sleep(poll_s)
+        avail, _ = _available_ram_gb()
+        if avail is None or avail >= need:
+            logger.info("[ft-guard] RAM recovered (%.0f GB available) after %.0f s — "
+                        "proceeding.", avail or 0.0, time.monotonic() - start)
+            return
+    logger.warning(
+        "[ft-guard] still only %.0f GB of RAM available after %.0f s — starting anyway. If "
+        "this run crawls in its first cycle, restart Fizgig between fine-tunes.",
+        avail or 0.0, timeout_s)
 
 
 def recommend_krea2_strategy(vram_gb: Optional[float] = None,
@@ -394,6 +644,40 @@ _NF4_COMPILE_PEAK_GB = 13.0
 # activations are bf16 either way, so the slope shouldn't depend on the weight format) — being
 # wrong here declines compile and the run proceeds uncompiled, which costs speed, never the run.
 _COMPILE_GB_PER_MP = 15.0
+# The OUTSIDE boundary (#99): checkpoint kept OUTSIDE the compiled region, so inductor's
+# partitioner stashes only what eager checkpointing stashes — recompute reruns the compiled
+# graph. Measured (Krea 2 INT8, 46 imgs @ 1.05 MP, rank 32, RTX 5090): peak ~18.7 GB net vs
+# eager's ~18.0, steady 2.4 s/step vs eager 3.30 (~27% faster), warm-up ~25 s (the per-block
+# graph is reused across Krea 2's 28 identical blocks). The constant is the measured need at
+# 1.05 MP; below that it is mildly conservative, which never matters — inside is preferred
+# wherever IT fits, and it fits everywhere small. Beyond 1.05 MP the inside slope is borrowed
+# as a deliberately-too-steep bound: over-declining runs eager (slower), never OOMs.
+_INT8_COMPILE_OUTSIDE_PEAK_GB = 19.0
+_COMPILE_OUTSIDE_ANCHOR_MP = 1.05
+
+
+def compile_boundary(quant_4bit: bool, quant_int8: str, vram_gb=None, caps=None,
+                     mp: float = 0.25, batch: int = 1) -> str:
+    """'inside' | 'outside' — where the gradient checkpoint sits for an EXPLICIT
+    Compile=On (#99). Never declines (On means on); it only places the boundary where
+    it fits: inside-the-graph is 1.19x faster per block but its stashes scale hard with
+    tokens (measured >32 GB at 1 MP on INT8), outside stays at eager-level stashes.
+    When inside doesn't fit, outside is the strictly safer gamble even near the edge."""
+    kind = "nf4" if quant_4bit else ("int8" if quant_int8 else None)
+    if kind != "int8":
+        return "inside"          # NF4/other: outside unmeasured — behave as before
+    caps = caps or detect()
+    vram = vram_gb if vram_gb is not None else (caps.vram_free_gb or caps.vram_gb)
+    if not vram:
+        # None OR the detect() default of 0.0 (no readable GPU): no basis to pick, and
+        # 0.0 falling through would read as "inside doesn't fit -> outside", which is a
+        # decision dressed as a default. Inside = today's behaviour.
+        return "inside"
+    _step_mp = float(mp) * max(1, int(batch))
+    _res_gb = _COMPILE_GB_PER_MP * max(0.0, _step_mp - 0.25)
+    if vram < _INT8_COMPILE_PEAK_GB + _res_gb + _HEADROOM_GB:
+        return "outside"
+    return "inside"
 
 
 def should_compile(total_steps: int, quant_4bit: bool, quant_int8: str,
@@ -410,6 +694,11 @@ def should_compile(total_steps: int, quant_4bit: bool, quant_int8: str,
     which is why only the compile gate needs them at this strength.
     """
     caps = caps or detect()
+    if caps.is_rocm:
+        return False, (
+            "ROCm/HIP PyTorch build — Auto leaves torch.compile off "
+            "(recompiles per bucket shape on HIP; set Compile Blocks to On to override)"
+        )
     vram = vram_gb if vram_gb is not None else (caps.vram_free_gb or caps.vram_gb)
 
     if blocks_to_swap:
@@ -419,6 +708,9 @@ def should_compile(total_steps: int, quant_4bit: bool, quant_int8: str,
         import triton  # noqa: F401
     except Exception:
         return False, "triton is not installed (pip install triton-windows on Windows)"
+    _ok, _why = triton_matches_torch()
+    if not _ok:
+        return False, _why
     if not has_host_c_compiler():
         return False, ("no C compiler on this system — inductor/triton build host-side stubs "
                        "with one at runtime (on Debian/Ubuntu: apt install gcc); "
@@ -431,10 +723,27 @@ def should_compile(total_steps: int, quant_4bit: bool, quant_int8: str,
     _res_gb = _COMPILE_GB_PER_MP * max(0.0, _step_mp - 0.25)
     _shape = (f" at {mp:.2f} MP" + (f" x batch {batch}" if batch > 1 else "")) if _res_gb else ""
     _fix = (" (lower Target Megapixels or batch size to compile)" if _res_gb else "")
+    _boundary = "inside"
     if kind == "int8" and vram < _INT8_COMPILE_PEAK_GB + _res_gb + _HEADROOM_GB:
-        return False, (f"INT8 + compile peaks near {_INT8_COMPILE_PEAK_GB + _res_gb:.0f} GB{_shape} "
-                       f"and only {vram:.1f} GB is free — INT8 alone still fits, compile does not"
-                       + _fix)
+        # Inside-the-graph doesn't fit at this token load — try the OUTSIDE boundary
+        # (#99): same fused kernels, eager-level stashes, measured ~27% faster than
+        # eager at 1 MP. Only falls to uncompiled when even that can't fit.
+        # Batch is charged at the measured EAGER term, not laundered through the step-MP
+        # slope (which only starts at the anchor): the outside boundary's stashes ARE
+        # eager-checkpointing stashes, and this module's own history says batch is the
+        # single biggest term and the classic blind spot ("batch 2 sailed through the
+        # check and OOM'd"). Resolution above the anchor keeps the deliberately-too-steep
+        # inside slope, on mp alone.
+        _out_need = (_INT8_COMPILE_OUTSIDE_PEAK_GB
+                     + _COMPILE_GB_PER_MP * max(0.0, float(mp) - _COMPILE_OUTSIDE_ANCHOR_MP)
+                     + _BATCH_GB_PER_IMAGE * max(0, int(batch) - 1))
+        if vram >= _out_need + _HEADROOM_GB:
+            _boundary = "outside"
+        else:
+            return False, (f"INT8 + compile peaks near {_INT8_COMPILE_PEAK_GB + _res_gb:.0f} "
+                           f"GB{_shape} (checkpoint-outside still ~{_out_need:.0f} GB) and only "
+                           f"{vram:.1f} GB is free — INT8 alone still fits, compile does not"
+                           + _fix)
     if kind == "nf4" and _res_gb and vram < _NF4_COMPILE_PEAK_GB + _res_gb + _HEADROOM_GB:
         return False, (f"NF4 + compile peaks near {_NF4_COMPILE_PEAK_GB + _res_gb:.0f} GB{_shape} "
                        f"and only {vram:.1f} GB is free — NF4 alone still fits, compile does not"
@@ -444,5 +753,11 @@ def should_compile(total_steps: int, quant_4bit: bool, quant_int8: str,
     if total_steps < needed:
         return False, (f"{total_steps} steps is too short — compiling costs ~{_COMPILE_WARMUP_S:.0f} s "
                        f"up front and needs ~{needed} steps on the {kind.upper()} path to pay back")
+    if _boundary == "outside":
+        # Truthy like True, so bool-minded callers keep working; boundary-aware callers
+        # (the Krea 2 trainer) pass it through to _compile_blocks.
+        return "outside", (f"{total_steps} steps on the {kind.upper()} path — inside-the-graph "
+                           f"doesn't fit{_shape}, compiling with the checkpoint OUTSIDE the "
+                           f"region instead (measured ~27% faster than eager at 1 MP)")
     return True, (f"{total_steps} steps on the {kind.upper()} path — compile pays back within "
                   f"~{needed} steps and this run is longer")

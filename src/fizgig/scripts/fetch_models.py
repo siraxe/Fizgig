@@ -5,7 +5,9 @@ into Preferences by hand. Run this instead and it fetches what's missing, verifi
 writes the paths into prefs.json for you.
 
     python -m fizgig.scripts.fetch_models --family krea2      # ~45 GB, no HF account needed
-    python -m fizgig.scripts.fetch_models --family klein      # ~34 GB, needs an HF token
+    python -m fizgig.scripts.fetch_models --family klein      # ~39 GB, needs an HF token
+    python -m fizgig.scripts.fetch_models --family minimax    # ~47 GB, no HF account needed
+    python -m fizgig.scripts.fetch_models --family qwen_image21 --include-optional   # ~38 GB, no HF account needed
     python -m fizgig.scripts.fetch_models --family tools      # ~1.6 GB helper models
     python -m fizgig.scripts.fetch_models --all
 
@@ -13,10 +15,11 @@ Two kinds of asset, handled differently:
 
   * WEIGHTS  — single .safetensors files. Downloaded into <repo>/models/ (or --models-dir)
                and written into prefs.json against the pref key the GUI reads.
-  * TOOLS    — Florence-2, the InsightFace face model, and the EN->ZH translator. These are
-               loaded BY NAME at runtime, not by path, so there's nothing to put in prefs —
-               "fetching" them means warming the cache they'll be loaded from, which turns a
-               mid-workflow stall into a one-off up-front download.
+  * TOOLS    — Florence-2, the InsightFace face model, the EN->ZH translator and Gizmo's
+               Whisper transcriber. These are loaded BY NAME at runtime, not by path, so
+               there's nothing to put in prefs — "fetching" them means warming the cache
+               they'll be loaded from, which turns a mid-workflow stall into a one-off
+               up-front download (and, for Whisper, guarantees Gizmo transcribes offline).
 
 Idempotent throughout: anything already present and valid is skipped, so it's safe to re-run
 and safe to call at container start. Resumable too — hf_hub_download picks a broken 26 GB
@@ -38,16 +41,24 @@ EMIT_PROGRESS = False
 class Weight:
     """One .safetensors file: where it lives on HF, where it goes, which pref points at it."""
 
-    def __init__(self, pref_key, repo, path_in_repo, gb, note, optional=False, gated=False):
+    def __init__(self, pref_key, repo, path_in_repo, gb, note, optional=False, gated=False, local_name=None):
         self.pref_key = pref_key
         self.repo = repo
         self.path_in_repo = path_in_repo
-        self.filename = os.path.basename(path_in_repo)
+        self.filename = local_name or os.path.basename(path_in_repo)   # local_name: see ModelFile.local_name
         self.gb = gb
         self.note = note
         self.optional = optional
         self.gated = gated
 
+
+# The Captions tab captions ANY dataset with the Krea 2 Qwen3-VL text encoder — it follows an
+# editable instruction and writes better training captions than Florence-2. So every family's
+# download button fetches it, not just Krea 2's: a Klein- or MiniMax-only user still captions.
+# Defined once so all three lists point at the same file and pref key.
+_CAPTION_TE = Weight("krea2_text_encoder", "Comfy-Org/Krea-2",
+                     "text_encoders/qwen3vl_4b_fp8_scaled.safetensors", 5.2,
+                     "Qwen3-VL text encoder — powers the Captions tab (shared with Krea 2)")
 
 # Paths verified against the HuggingFace API, not the README — the two can drift.
 FAMILIES = {
@@ -55,9 +66,7 @@ FAMILIES = {
         Weight("krea2_raw_dit", "Comfy-Org/Krea-2",
                "diffusion_models/krea2_raw_bf16.safetensors", 26.0,
                "RAW DiT — what training runs on"),
-        Weight("krea2_text_encoder", "Comfy-Org/Krea-2",
-               "text_encoders/qwen3vl_4b_fp8_scaled.safetensors", 5.2,
-               "Qwen3-VL text encoder (fp8 — recommended; also writes your captions)"),
+        _CAPTION_TE,
         Weight("krea2_vae", "Comfy-Org/Krea-2",
                "vae/qwen_image_vae.safetensors", 0.25, "Qwen-Image VAE"),
         Weight("krea2_turbo_lora", "Comfy-Org/Krea-2",
@@ -66,6 +75,45 @@ FAMILIES = {
         Weight("krea2_turbo_dit", "Comfy-Org/Krea-2",
                "diffusion_models/krea2_turbo_fp8_scaled.safetensors", 13.0,
                "Turbo DiT — Repair Studio, Explorer, Royale and classic previews"),
+    ],
+    "minimax": [
+        Weight("minimax_dit", "Comfy-Org/MiniMax-H3",
+               "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors", 21.0,
+               "H3 DiT (pruned int8) — the training base, the file ComfyUI runs"),
+        Weight("minimax_text_encoder", "Comfy-Org/MiniMax-H3",
+               "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", 15.7,
+               "Qwen3-VL-32B text encoder (nvfp4 — the compact ComfyUI file)"),
+        Weight("minimax_vae", "Comfy-Org/MiniMax-H3",
+               "vae/minimax_h3_video_vae_fp16.safetensors", 4.9,
+               "Video VAE — caching + preview decode"),
+        # Not behind --include-optional: 605 MB against this family's 47 GB is nothing, and a
+        # user who adds video clips later would otherwise have to come back for one small file.
+        Weight("minimax_audio_vae", "Comfy-Org/MiniMax-H3",
+               "vae/minimax_h3_audio_vae_fp32.safetensors", 0.61,
+               "Audio VAE — training on the sound in video clips"),
+        # Same reasoning: 780 MB buys 6-step previews for every H3 run.
+        Weight("minimax_turbo_lora", "larryvrh/MiniMax-H3-Turbo-Lora",
+               "minimax_h3_turbo_v4_step600.safetensors", 0.78,
+               "Turbo LoRA — fast 6-step in-training previews"),
+        # Training adapters, picked by the Training tab's dropdown: Circlestone (the default, one
+        # 620 MB file for both bases) and Ostris's pair (155 MB each, one per base, for video-only
+        # datasets). All fetched — small next to the DiT.
+        Weight("minimax_circlestone_adapter", "circlestone-labs/MiniMax-H3-Image-Training-Adapter",
+               "minimax_h3_image_training_adapter.safetensors", 0.62,
+               "Training adapter (Circlestone) — the default, one file for both bases"),
+        Weight("minimax_training_adapter", "ostris/minimax_h3_training_adapter",
+               "minimax_h3_training_adapter_v1.safetensors", 0.16,
+               "Training adapter (fl2va) — de-distills the base while your LoRA learns (Ostris)"),
+        Weight("minimax_ref_training_adapter", "ostris/minimax_h3_training_adapter",
+               "minimax_h3_ref2va_training_adapter_v1.safetensors", 0.16,
+               "Training adapter (ref2va) — the same, for runs on the reference base (Ostris)"),
+        # ref2va is a DIFFERENT fine-tune, needed only for reference distillation — 21 GB most
+        # users don't want on a first setup, so it rides behind --include-optional like the
+        # Krea 2 Turbo DiT does.
+        Weight("minimax_ref_dit", "Comfy-Org/MiniMax-H3",
+               "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors", 21.0,
+               "Reference DiT (ref2va) — reference distillation only", optional=True),
+        _CAPTION_TE,
     ],
     "klein": [
         Weight("base_dit", "black-forest-labs/FLUX.2-klein-base-9b-fp8",
@@ -80,20 +128,58 @@ FAMILIES = {
         Weight("distilled_dit", "black-forest-labs/FLUX.2-klein-9b-fp8",
                "flux-2-klein-9b-fp8.safetensors", 9.0,
                "Distilled DiT — 4-step previews and the workbench", gated=True),
+        _CAPTION_TE,
     ],
 }
+
+
+
+def _described_families():
+    """Families added through the standard layer (fizgig.families): their download lists come from their
+    descriptions (model_files), never from a hand-written list here. Not part of --all (opt-in)."""
+    try:
+        sys.path.insert(0, os.path.join(REPO_DIR, "src"))
+        from fizgig.families.registry import FAMILIES as _REG
+    except Exception:
+        return {}
+    # Every family's button also fetches the Captions tab's Qwen3-VL captioner, as the old families' lists do.
+    return {d.key: [Weight(f.pref_key, f.repo, f.path, f.size_gb, f.label + (" — " + f.note if f.note else ""),
+                           optional=not f.required, local_name=f.local_name or None)
+                    for f in d.model_files if f.repo and f.path] + [_CAPTION_TE]
+            for d in _REG.values() if d.training_ready}
+
+
+def _described_helpers():
+    """Small tokenizer/processor files the described families' text encoders load by name (description
+    `helper_files`: (repo, allow_patterns) pairs), fetched with the other helpers so first use works offline."""
+    try:
+        from fizgig.families.registry import FAMILIES as _REG
+    except Exception:
+        return []
+    return [(f"hf-files:{repo}|{','.join(pats)}", 0.02, f"{d.display_name} tokenizer / processor")
+            for d in _REG.values() if d.training_ready for repo, pats in d.helper_files]
+
+
+DESCRIBED = _described_families()
+FAMILIES.update(DESCRIBED)
 
 # Loaded by name at runtime, so there is no pref to write — see the module docstring.
 TOOLS = [
     ("MiaoshouAI/Florence-2-base-PromptGen", 1.0, "Florence-2 captioner"),
     ("Helsinki-NLP/opus-mt-en-zh", 0.3, "EN->ZH translator (bilingual captions)"),
     ("insightface:buffalo_l", 0.3, "Face model — Look Filter + likeness scoring"),
+    # hf-model: config + tokenizer + safetensors only. The repo also carries .bin/.msgpack/.h5
+    # duplicates of the same weights — an unfiltered snapshot would pull 1.16 GB for a 0.3 GB
+    # model. Gizmo checks this cache before loading (gizmo.py local_whisper_dir) and stays
+    # offline once it's here; the pattern lists MUST match.
+    ("hf-model:openai/whisper-base", 0.3, "Whisper — Gizmo's Transcribe button, offline"),
     # Tokenizer/processor configs only (hf-config: skips the weights — those load from the
     # user's own safetensors). A few MB each, and the difference between "captioning and text
     # encoding work offline" and "the first use needs internet for a vocab file".
     ("hf-config:Qwen/Qwen3-VL-4B-Instruct", 0.02, "Qwen3-VL tokenizer — Krea 2 offline"),
     ("hf-config:Qwen/Qwen3-8B", 0.02, "Qwen3 tokenizer — Klein offline"),
 ]
+TOOLS += _described_helpers()
 
 
 def _valid_safetensors(path, min_bytes):
@@ -303,6 +389,18 @@ def fetch_tool(spec, log=print, dry_run=False):
             from huggingface_hub import snapshot_download
             snapshot_download(repo_id=model_id.split(":", 1)[1],
                               allow_patterns=["*.json", "*.txt", "*.model"])
+        elif model_id.startswith("hf-files:"):
+            # A repo's small named files only (e.g. a processor/ folder), never its weights.
+            from huggingface_hub import snapshot_download
+            repo, _, pats = model_id[len("hf-files:"):].partition("|")
+            snapshot_download(repo_id=repo, allow_patterns=pats.split(","))
+        elif model_id.startswith("hf-model:"):
+            # Configs + tokenizer + the safetensors weights — skipping the .bin/.msgpack/.h5
+            # duplicates these repos also carry. Keep in lockstep with the runtime's
+            # local-cache check (gizmo.py _WHISPER_PATTERNS).
+            from huggingface_hub import snapshot_download
+            snapshot_download(repo_id=model_id.split(":", 1)[1],
+                              allow_patterns=["*.json", "*.txt", "*.model", "*.safetensors"])
         else:
             from huggingface_hub import snapshot_download
             snapshot_download(repo_id=model_id)
@@ -338,7 +436,7 @@ def fetch(families, models_dir=None, repo_dir=REPO_DIR, token=None, include_opti
     ok = True
     for fam in families:
         if fam == "tools":
-            log("Helper models (Florence-2, face model, translator):")
+            log("Helper models (Florence-2, face model, translator, Whisper):")
             for spec in TOOLS:
                 fetch_tool(spec, log=log, dry_run=dry_run)   # never fails the run
             log("")
@@ -368,11 +466,12 @@ def fetch(families, models_dir=None, repo_dir=REPO_DIR, token=None, include_opti
 def main():
     p = argparse.ArgumentParser(
         description="Download Fizgig's model files and write them into Preferences.")
-    p.add_argument("--family", action="append", choices=["krea2", "klein", "tools"],
+    p.add_argument("--family", action="append", choices=["krea2", "klein", "minimax", "tools", *DESCRIBED],
                    help="Repeatable. Krea 2 needs no HF account; Klein is gated.")
     p.add_argument("--all", action="store_true", help="Every family, including the helper models.")
     p.add_argument("--include-optional", action="store_true",
-                   help="Also fetch workbench-only files (Krea 2 Turbo DiT, ~13 GB).")
+                   help="Also fetch the optional files (Krea 2 Turbo DiT ~13 GB, "
+                        "MiniMax ref2va DiT ~21 GB).")
     p.add_argument("--models-dir", default=None, help="Default: <repo>/models")
     p.add_argument("--token", default=None, help="HuggingFace token for gated repos (or HF_TOKEN).")
     p.add_argument("--dry-run", action="store_true", help="Show what would be fetched.")
@@ -392,7 +491,7 @@ def main():
         except Exception:
             pass
 
-    families = ["krea2", "klein", "tools"] if a.all else (a.family or [])
+    families = ["krea2", "klein", "minimax", "tools"] if a.all else (a.family or [])
     if not families:
         p.error("pick --family krea2|klein|tools (repeatable), or --all")
 

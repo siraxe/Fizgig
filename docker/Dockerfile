@@ -31,13 +31,13 @@ RUN python3 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 COPY requirements.txt /tmp/requirements.txt
+COPY uv_install_deps.py /tmp/uv_install_deps.py
 # The cache purge has to happen in THIS layer: a later RUN would delete the files but the layer
 # holding them stays in the image. uv keeps its own wheel cache and ignores PIP_NO_CACHE_DIR,
 # which is how a first build shipped 7.8 GB of wheels alongside the 7.8 GB venv they installed.
 RUN pip install --upgrade pip uv \
-    && uv pip install --link-mode=copy --index-strategy unsafe-best-match \
-         -r /tmp/requirements.txt \
-    && rm -rf /root/.cache /tmp/requirements.txt
+    && python3 /tmp/uv_install_deps.py /tmp/requirements.txt "$VIRTUAL_ENV" \
+    && rm -rf /root/.cache /tmp/requirements.txt /tmp/uv_install_deps.py
 
 # ---------------------------------------------------------------------------- runtime
 FROM ubuntu:22.04
@@ -51,7 +51,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-venv \
       python3-tk \
       git curl ca-certificates \
-      gcc libc6-dev \
+      gcc libc6-dev python3-dev \
       xvfb openbox x11-utils wmctrl \
       libxfont2 libgbm1 libgl1-mesa-dri libegl1 \
       libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
@@ -70,6 +70,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # cleanly when no cc exists, but shipping one is what makes compile actually WORK on pods —
 # it's a real speed win on the INT8/NF4 paths. Not build-essential: g++/make/dpkg-dev would
 # triple the size for nothing.
+# python3-dev rides with them for the same reason: triton's stubs #include <Python.h>, so a
+# compiler without the headers gets further and then dies with "Python.h: No such file or
+# directory" (reported by a RunPod user on Krea 2, 7 Aug 2026). The builder stage always had
+# it — the runtime is where compile actually runs.
 # pcmanfm is what makes the "Open folder" buttons work: _open_in_file_manager shells out to
 # xdg-open, which needs something to hand the folder to.
 #
